@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Jaap van der Meer
-# SPDX-License-Identifier: LicenseRef-Thermozona-Commercial
-"""Sponsor-required number entities for Thermozona Pro."""
+# SPDX-License-Identifier: MIT
+"""Number entities for advanced Thermozona controls."""
 from __future__ import annotations
 
 from homeassistant.components.number import NumberEntity

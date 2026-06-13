@@ -36,11 +36,8 @@ async def async_setup_entry(
 
     entities: list[NumberEntity] = [
         ThermozonaFlowTemperatureNumber(config_entry.entry_id, controller),
+        ThermozonaFlowCurveOffsetNumber(config_entry.entry_id, controller),
     ]
-    if controller.pro_enabled:
-        entities.append(
-            ThermozonaFlowCurveOffsetNumber(config_entry.entry_id, controller)
-        )
 
     async_add_entities(entities)
 

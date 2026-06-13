@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Jaap van der Meer
-# SPDX-License-Identifier: LicenseRef-Thermozona-Commercial
-"""Sponsor-required PWM/PI helpers."""
+# SPDX-License-Identifier: MIT
+"""PWM/PI helpers."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone

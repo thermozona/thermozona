@@ -61,7 +61,6 @@ CONF_PWM_ACTUATOR_DELAY = "pwm_actuator_delay"
 CONF_ZONE_RESPONSE = "zone_response"
 CONF_ZONE_FLOW_WEIGHT = "zone_flow_weight"
 CONF_ZONE_SOLAR_WEIGHT = "zone_solar_weight"
-CONF_LICENSE_KEY = "license_key"
 
 CONTROL_MODE_BANG_BANG = "bang_bang"
 CONTROL_MODE_PWM = "pwm"
@@ -231,7 +230,6 @@ PRO_FLOW_SCHEMA = vol.Schema(
 
 PRO_SCHEMA = vol.Schema(
     {
-        vol.Optional(CONF_LICENSE_KEY): cv.string,
         vol.Optional(
             CONF_PRO_FLOW,
             default={},

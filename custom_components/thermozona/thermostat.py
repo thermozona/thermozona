@@ -112,13 +112,6 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         )
 
         self._control_mode = control_mode or CONTROL_MODE_BANG_BANG
-        if self._control_mode == CONTROL_MODE_PWM and not self._controller.pro_enabled:
-            _LOGGER.warning(
-                "%s: PWM mode for zone %s requires a Pro license; using bang_bang",
-                DOMAIN,
-                self._zone_name,
-            )
-            self._control_mode = CONTROL_MODE_BANG_BANG
         self._pwm_cycle_time_minutes = pwm_cycle_time or DEFAULT_PWM_CYCLE_TIME
         self._pwm_min_on_time_minutes = pwm_min_on_time or DEFAULT_PWM_MIN_ON_TIME
         self._pwm_min_off_time_minutes = pwm_min_off_time or DEFAULT_PWM_MIN_OFF_TIME

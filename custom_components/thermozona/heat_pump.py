@@ -16,7 +16,6 @@ from . import (
     CONF_FLOW_TEMP_SENSOR,
     CONF_HEAT_PUMP_MODE,
     CONF_PRO,
-    CONF_LICENSE_KEY,
     CONF_COOLING_BASE_OFFSET,
     CONF_HEATING_BASE_OFFSET,
     CONF_PRO_FLOW,
@@ -44,9 +43,6 @@ from . import (
     FLOW_MODE_SIMPLE,
 )
 from .helpers import resolve_circuits
-from .licensing import LicenseValidationResult
-from .licensing import normalize_license_key
-from .licensing import validate_pro_license_key
 from .pro.flow_curve import FlowCurveRuntimeManager
 from .pro.flow_supervisor import ProFlowSupervisor
 
@@ -89,15 +85,8 @@ class HeatPumpController:
         self._mode_select: weakref.ReferenceType[
             ThermozonaHeatPumpModeSelect
         ] | None = None
-        license_result = validate_pro_license_key(self._pro_license_key())
-        self._pro_enabled = license_result.is_valid
         self._flow_mode = FLOW_MODE_SIMPLE
-
-        self._apply_license_state(
-            self._pro_license_key(),
-            license_result,
-            entry_config.get(CONF_FLOW_MODE),
-        )
+        self._apply_flow_mode(entry_config.get(CONF_FLOW_MODE))
         self._mode_value: str = "auto"
         self._mode_entity_id: str | None = None
         self._pump_state: str = "idle"
@@ -110,34 +99,17 @@ class HeatPumpController:
         self._pro_flow_supervisor = ProFlowSupervisor()
 
     @property
-    def pro_enabled(self) -> bool:
-        """Return whether advanced Pro features are enabled."""
-        return self._pro_enabled
-
-    @property
     def flow_mode(self) -> str:
-        """Return active flow mode after Pro-license gating."""
+        """Return active flow mode."""
         return self._flow_mode
 
-    def _apply_license_state(
+    def _apply_flow_mode(
         self,
-        raw_license_key: str | None,
-        license_result: LicenseValidationResult,
         configured_flow_mode: str | None,
     ) -> None:
-        """Apply Pro-license state and gate Pro-only flow mode safely."""
-        normalized_key = normalize_license_key(raw_license_key)
-        if normalized_key and not license_result.is_valid:
-            _LOGGER.warning(
-                "%s: Invalid Pro license token; Pro features disabled (%s)",
-                DOMAIN,
-                license_result.reason,
-            )
-
+        """Apply configured flow mode safely."""
         if configured_flow_mode is None:
-            requested_flow_mode = (
-                FLOW_MODE_PRO_SUPERVISOR if self._pro_enabled else FLOW_MODE_SIMPLE
-            )
+            requested_flow_mode = FLOW_MODE_SIMPLE
         else:
             requested_flow_mode = str(configured_flow_mode).lower()
         if requested_flow_mode not in {FLOW_MODE_SIMPLE, FLOW_MODE_PRO_SUPERVISOR}:
@@ -145,15 +117,6 @@ class HeatPumpController:
                 "%s: Unsupported flow_mode '%s'; falling back to '%s'",
                 DOMAIN,
                 requested_flow_mode,
-                FLOW_MODE_SIMPLE,
-            )
-            requested_flow_mode = FLOW_MODE_SIMPLE
-
-        if requested_flow_mode == FLOW_MODE_PRO_SUPERVISOR and not self._pro_enabled:
-            _LOGGER.warning(
-                "%s: flow_mode '%s' requires a valid Pro license; falling back to '%s'",
-                DOMAIN,
-                FLOW_MODE_PRO_SUPERVISOR,
                 FLOW_MODE_SIMPLE,
             )
             requested_flow_mode = FLOW_MODE_SIMPLE
@@ -203,9 +166,6 @@ class HeatPumpController:
 
     def _pro_config(self) -> dict[str, Any]:
         return self._entry_config.get(CONF_PRO, {})
-
-    def _pro_license_key(self) -> str | None:
-        return self._pro_config().get(CONF_LICENSE_KEY)
 
     def _pro_flow_config(self) -> dict[str, Any]:
         return self._pro_config().get(CONF_PRO_FLOW, {})
@@ -287,12 +247,6 @@ class HeatPumpController:
 
     def set_flow_curve_offset(self, value: float) -> None:
         """Set runtime flow-curve offset override from the UI helper number."""
-        if not self._pro_enabled:
-            _LOGGER.debug(
-                "%s: Ignoring flow-curve runtime override in free tier",
-                DOMAIN,
-            )
-            return
         self._flow_curve_runtime.set_override(value)
 
     def reset_flow_curve_offset(self) -> None:
@@ -586,7 +540,7 @@ class HeatPumpController:
         outside_temp: float | None,
         statuses: list[dict[str, Any]],
     ) -> float:
-        """Return simple free-tier flow strategy based on zone targets and weather."""
+        """Return simple flow strategy based on zone targets and weather."""
         max_target = max(float(status["target"]) for status in statuses)
         min_target = min(float(status["target"]) for status in statuses)
 
@@ -1018,13 +972,7 @@ class HeatPumpController:
     def refresh_entry_config(self, entry_config: dict[str, Any]) -> None:
         """Update internal reference to the config entry (for reload scenarios)."""
         self._entry_config = entry_config
-        license_result = validate_pro_license_key(self._pro_license_key())
-        self._pro_enabled = license_result.is_valid
-        self._apply_license_state(
-            self._pro_license_key(),
-            license_result,
-            entry_config.get(CONF_FLOW_MODE),
-        )
+        self._apply_flow_mode(entry_config.get(CONF_FLOW_MODE))
         self._pro_flow_supervisor.reset()
         self._last_flow_write_temp = None
         self._last_flow_write_time = None

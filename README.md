@@ -33,53 +33,11 @@ On the heat source side I connected an Ecoforest EcoGeo B2 over Modbus, but Ther
 The dashboard shows one thermostat per zone you define in `configuration.yaml`. Each zone maps to a separate underfloor circuit (or group of circuits), giving you granular control from Home Assistant while Thermozona keeps the heat pump in sync.
 
 ## Highlights ⚡
-- 🧠 **Smart controller** – Free tier includes manual and auto heat/cool switching.
+- 🧠 **Smart controller** – Manual and auto heat/cool switching.
 - 🌡️ **Weather compensation** – Dynamically adjusts flow temperature based on the outdoor climate.
 - 🧩 **Flexible zones** – Combine multiple circuits per room and bring your favorite temperature sensors.
 - 🎛️ **Full climate entities** – Each zone shows up as a native climate entity inside Home Assistant.
-- 🚀 **Tiered model** – Core stays free; advanced control features are unlocked with a local sponsorship key.
-
-## Sponsorship model: Free vs Sponsor License
-
-Thermozona is community-funded. The core integration stays open and free, while sponsor-required components unlock advanced control features.
-
-| Free (MIT, HACS) | Sponsor License (license key) |
-|---|---|
-| Bang-bang regeling per zone | PWM/PI control mode |
-| Handmatige + auto heat/cool mode | Runtime flow-curve tuning |
-| Simple flow mode + weather compensation | Pro flow supervisor (DI, slow/fast weighting, preheat) |
-| Warmtepomp status entities | Stagger optimization across zones |
-|  | Actuator delay compensation |
-
-`pro.license_key` must be a valid signed JWT and is validated locally (signature + claims + time window) at integration load time. There is no cloud dependency.
-
-You will be able to get a Sponsor token at `https://github.com/sponsors/thermozona`. This is not online yet; in the meantime, request a token by email at `info@thermozona.com`.
-
-## Pro license generation
-
-Thermozona Pro tokens are signed with **Ed25519**. The integration ships with a public key and only accepts tokens signed by the matching private key.
-For full generation instructions, environment variable details, and examples, run:
-
-```bash
-python scripts/issue_pro_license.py --help
-```
-
-Optional local verification:
-
-```bash
-python scripts/verify_pro_license.py "<jwt-token>"
-```
-
-Place the generated token in `configuration.yaml`:
-
-```yaml
-thermozona:
-  pro:
-    license_key: "<jwt-token>"
-  # flow_mode: pro_supervisor  # Optional override; auto-selects pro_supervisor when license is valid
-```
-
-⚠️ Never commit private keys to this repository, Home Assistant config backups, CI logs, or shell history.
+- 🚀 **Open advanced control** – PWM/PI, runtime flow-curve tuning, and demand-weighted flow supervision are available to every installation.
 
 ## Flow Temperature breakdown attributes
 
@@ -107,28 +65,11 @@ Simple mode (examples):
 - `weather_slope`: configured weather slope
 - `weather_comp_c`: outside-temperature compensation term
 
-Pro supervisor (heating) adds demand-related terms such as:
+Advanced supervisor (heating) adds demand-related terms such as:
 
 - `demand_index`, `di_slow`, `di_fast`
 - `kp`, `trim_p_c`, `integral_enabled`, `integral_c`
 - `fast_boost_c`, `preheat_boost_c`
-
-
-For key rotation, you can provide multiple public keys to Home Assistant via `THERMOZONA_LICENSE_PUBLIC_KEYS_JSON` as a JSON object (`{"kid":"-----BEGIN PUBLIC KEY-----..."}`), while issuer tokens set the matching `kid` header.
-
-### Key rotation runbook
-
-1. Generate a new Ed25519 key pair and store the private key in your password manager (for example KeePass).
-2. Add the new public key to `THERMOZONA_LICENSE_PUBLIC_KEYS_JSON` next to the current key (keep both active during migration).
-3. Start issuing new tokens with the new `--kid` value.
-4. Wait until old tokens naturally expire.
-5. Remove the old `kid` from `THERMOZONA_LICENSE_PUBLIC_KEYS_JSON`.
-
-## Licensing transparency
-
-- Core/open components are licensed under MIT (`LICENSE`).
-- Sponsor-required components are excluded from MIT and licensed under `LICENSE-COMMERCIAL.md`.
-- See `NOTICE` and file headers for component-level licensing.
 
 ## Installation 🚧
 
@@ -180,12 +121,11 @@ thermozona:
   flow_curve_offset: 0.0    # Optional baseline for UI flow-curve tuning
   weather_slope_heat: 0.25  # Optional weather slope for heating
   weather_slope_cool: 0.20  # Optional weather slope for cooling
-  simple_flow:              # Optional free-tier write behavior
+  simple_flow:              # Optional simple-mode write behavior
     write_deadband_c: 0.5
     write_min_interval_minutes: 15
-  pro:                      # Optional Sponsor License config
-    license_key: eyJhbGciOi...<signed_pro_token>
-    flow:                   # Optional Pro supervisor tuning
+  pro:                      # Optional advanced flow-supervisor tuning
+    flow:
       kp: 1.0
       use_integral: false
       ti_minutes: 180
@@ -218,9 +158,9 @@ thermozona:
       temp_sensor: sensor.living_room
       hysteresis: 0.2
       zone_response: slow    # Optional: slow (default) or fast
-      zone_flow_weight: 1.0  # Optional: influence in Pro flow supervisor
+      zone_flow_weight: 1.0  # Optional: influence in pro_supervisor flow mode
       zone_solar_weight: 1.6 # Optional: higher value = stronger solar softening impact for this zone
-      control_mode: pwm        # Optional: bang_bang (free) or pwm (Sponsor License)
+      control_mode: pwm        # Optional: bang_bang or pwm
       pwm_cycle_time: 15       # Optional: 5-30 minutes (default 15)
       pwm_min_on_time: 3       # Optional: 1-10 minutes (default 3)
       pwm_min_off_time: 3      # Optional: 1-10 minutes (default 3)
@@ -252,8 +192,8 @@ Need quick day-to-day adjustment without editing YAML? Use `number.thermozona_fl
 
 Thermozona supports two zone control strategies:
 
-- `bang_bang` (default, free): classic hysteresis switching using `hysteresis` around the setpoint.
-- `pwm` (Sponsor License): PI-driven pulse-width modulation to reduce overshoot in high thermal-mass floors.
+- `bang_bang` (default): classic hysteresis switching using `hysteresis` around the setpoint.
+- `pwm`: PI-driven pulse-width modulation to reduce overshoot in high thermal-mass floors.
 
 When `control_mode: pwm` is enabled on a zone, Thermozona calculates a duty cycle (0–100%) every PWM cycle and turns all zone circuits on/off for the corresponding time slice.
 
@@ -267,14 +207,14 @@ When `control_mode: pwm` is enabled on a zone, Thermozona calculates a duty cycl
 
 Use `pwm` for slow floor loops that overshoot with on/off control; keep `bang_bang` for simpler zones where hysteresis already behaves well.
 
-### Flow mode: simple vs Pro supervisor
+### Flow mode: simple vs pro_supervisor
 
-- `flow_mode: simple` (free): flow follows the highest active target plus weather compensation.
-- `flow_mode: pro_supervisor` (Sponsor License): demand-weighted flow supervision with slow/fast zone balancing, asymmetric slew limiting, and optional preheat forecast + solar-gain compensation.
+- `flow_mode: simple`: flow follows the highest active target plus weather compensation.
+- `flow_mode: pro_supervisor`: demand-weighted flow supervision with slow/fast zone balancing, asymmetric slew limiting, and optional preheat forecast + solar-gain compensation.
 
-If `flow_mode` is omitted, Thermozona auto-selects `pro_supervisor` when `pro.license_key` is valid, otherwise `simple`.
+If `flow_mode` is omitted, Thermozona uses `simple`.
 
-Per-zone Pro metadata:
+Per-zone flow-supervisor metadata:
 
 - `zone_response`: `slow` (default) or `fast`.
 - `zone_flow_weight`: weighting factor (default `1.0`) used by the Pro flow supervisor.
@@ -368,9 +308,9 @@ Troubleshooting 🔍:
 - If the corrected sensor falls back to local temperature often, check whether `weather.get_forecasts` returns hourly data for your provider.
 - If `provider_now` is unavailable, correction defaults to `0` and the sensor uses raw forecast.
 
-#### ☀️ Free source for `preheat_solar_sensor` (2h solar forecast)
+#### ☀️ Open-Meteo source for `preheat_solar_sensor` (2h solar forecast)
 
-`preheat_solar_sensor` is part of the **Pro flow supervisor** path (`flow_mode: pro_supervisor`) and is therefore a Sponsor License feature.
+`preheat_solar_sensor` is part of the `pro_supervisor` flow mode.
 
 You can still feed it with a free data source. A practical option is Open-Meteo (no API key), which exposes hourly `shortwave_radiation` in `W/m2`.
 
@@ -469,9 +409,6 @@ Issues, feature requests, and pull requests are very welcome! Share how you are 
 - The authors and contributors are not liable for any damages, losses, injuries, equipment failures, or incidents (including overheating, water damage, or fire) resulting from installation, configuration, or use.
 
 ## License 📄
-This project is licensed under the MIT license for open components. See `LICENSE`.
-
-Sponsor-required components are excluded from the MIT license and are licensed under `LICENSE-COMMERCIAL.md`.
-See `NOTICE` and file license headers for component-level licensing.
+This project is licensed under the MIT license. See `LICENSE`.
 
 Warm regards and have fun making your floors extra comfy! 🔥🧦

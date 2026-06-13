@@ -57,14 +57,13 @@ input_boolean:
 # Safety notice: Use at your own risk; ensure code-compliant installation/wiring. Authors/contributors are not liable for damage, injury, or fire.
 thermozona:
   outside_temp_sensor: sensor.test_buiten_temperatuur
-  # flow_mode: simple  # Optional override; auto-selects pro_supervisor when pro.license_key is valid
+  # flow_mode: simple  # Optional override: simple or pro_supervisor
   # heating_base_offset: 3.0
   # weather_slope_heat: 0.25
 
-  # Optional Pro block.
-  # Keep it small here; see README for the full Pro tuning matrix.
+  # Optional advanced flow-supervisor tuning.
+  # Keep it small here; see README for the full tuning matrix.
   pro:
-    # license_key: eyJhbGciOi...<signed_pro_token>
     flow:
       # preheat_enabled: true
       # preheat_forecast_sensor: sensor.outdoor_forecast_2h

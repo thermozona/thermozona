@@ -1,41 +1,17 @@
 from __future__ import annotations
 
-import base64
-import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from custom_components.thermozona.helpers import resolve_circuits
 from custom_components.thermozona.heat_pump import HeatPumpController
-from custom_components.thermozona.licensing import is_github_sponsor_token
-from custom_components.thermozona.licensing import is_pro_license_key
-from custom_components.thermozona.licensing import PRO_LICENSE_DEFAULT_KEY_ID
-from custom_components.thermozona.licensing import validate_pro_license_key
 from custom_components.thermozona.sensor import ThermozonaFlowTemperatureSensor
 from custom_components.thermozona.select import ThermozonaHeatPumpModeSelect
 from custom_components.thermozona.thermostat import ThermozonaThermostat
 from homeassistant.components.climate import HVACAction, HVACMode
 from homeassistant.const import ATTR_TEMPERATURE
-
-
-TEST_LICENSE_PRIVATE_KEY = Ed25519PrivateKey.generate()
-TEST_LICENSE_PUBLIC_PEM = (
-    TEST_LICENSE_PRIVATE_KEY.public_key()
-    .public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    .decode("utf-8")
-)
-
-
-@pytest.fixture(autouse=True)
-def _set_test_license_public_key(monkeypatch):
-    monkeypatch.setenv("THERMOZONA_LICENSE_PUBLIC_KEY_PEM", TEST_LICENSE_PUBLIC_PEM)
 
 
 class DummyNumber:
@@ -83,7 +59,7 @@ class RecordingThermostat(ThermozonaThermostat):
         self.write_calls += 1
 
 
-def _config(*, pro=True, **overrides):
+def _config(**overrides):
     base = {
         "outside_temp_sensor": "sensor.outside",
         "flow_temp_sensor": "input_number.flow",
@@ -94,212 +70,20 @@ def _config(*, pro=True, **overrides):
             }
         },
     }
-    if pro:
-        base["pro"] = {"license_key": _valid_sponsor_token()}
 
     if "pro_flow" in overrides:
         pro_config = dict(base.get("pro", {}))
         pro_config["flow"] = overrides.pop("pro_flow")
         base["pro"] = pro_config
 
-    if "license_key" in overrides:
-        pro_config = dict(base.get("pro", {}))
-        pro_config["license_key"] = overrides.pop("license_key")
-        base["pro"] = pro_config
-
     base.update(overrides)
     return base
-
-
-def _jwt(payload: dict, *, kid: str | None = PRO_LICENSE_DEFAULT_KEY_ID) -> str:
-    header = {"alg": "EdDSA", "typ": "JWT"}
-    if kid is not None:
-        header["kid"] = kid
-
-    def _enc(data: dict) -> str:
-        raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
-        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-    encoded_header = _enc(header)
-    encoded_payload = _enc(payload)
-    signing_input = f"{encoded_header}.{encoded_payload}".encode("ascii")
-    signature = TEST_LICENSE_PRIVATE_KEY.sign(signing_input)
-    encoded_signature = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
-    return f"{encoded_header}.{encoded_payload}.{encoded_signature}"
-
-
-def _valid_sponsor_token() -> str:
-    now = int(datetime.now(timezone.utc).timestamp())
-    return _jwt(
-        {
-            "iss": "thermozona.appventures.nl",
-            "sub": "test-user",
-            "src": "github_sponsors",
-            "tier": "pro",
-            "iat": now - 10,
-            "exp": now + 3600,
-        }
-    )
 
 
 def test_resolve_circuits_supports_new_and_legacy_keys():
     assert resolve_circuits({"circuits": ["switch.a"]}) == ["switch.a"]
     assert resolve_circuits({"groups": ["switch.b"]}) == ["switch.b"]
     assert resolve_circuits({}) == []
-
-
-def test_pro_license_key_requires_sponsor_token():
-    assert is_pro_license_key(_valid_sponsor_token()) is True
-    assert is_pro_license_key("TZPRO-AB12-CD34-EF56") is False
-    assert is_pro_license_key("TZPRO-AB12-CD34") is False
-    assert is_pro_license_key("invalid") is False
-
-
-def test_github_sponsor_token_validation():
-    now = int(datetime.now(timezone.utc).timestamp())
-    token = _jwt(
-        {
-            "iss": "thermozona.appventures.nl",
-            "sub": "japetheape",
-            "src": "github_sponsors",
-            "tier": "pro",
-            "iat": now - 10,
-            "exp": now + 3600,
-        }
-    )
-
-    assert is_github_sponsor_token(token) is True
-    assert is_pro_license_key(token) is True
-
-
-def test_github_sponsor_token_rejects_invalid_claims():
-    now = int(datetime.now(timezone.utc).timestamp())
-    expired = _jwt(
-        {
-            "iss": "thermozona",
-            "sub": "japetheape",
-            "src": "github_sponsors",
-            "tier": "pro",
-            "iat": now - 20,
-            "exp": now - 1,
-        }
-    )
-    wrong_src = _jwt(
-        {
-            "iss": "thermozona",
-            "sub": "japetheape",
-            "src": "other",
-            "tier": "pro",
-            "iat": now - 20,
-            "exp": now + 3600,
-        }
-    )
-    wrong_tier = _jwt(
-        {
-            "iss": "thermozona",
-            "sub": "japetheape",
-            "src": "github_sponsors",
-            "tier": "basic",
-            "iat": now - 20,
-            "exp": now + 3600,
-        }
-    )
-    empty_sub = _jwt(
-        {
-            "iss": "thermozona",
-            "sub": "   ",
-            "src": "github_sponsors",
-            "tier": "pro",
-            "iat": now - 20,
-            "exp": now + 3600,
-        }
-    )
-    future_nbf = _jwt(
-        {
-            "iss": "thermozona",
-            "sub": "japetheape",
-            "src": "github_sponsors",
-            "tier": "pro",
-            "iat": now,
-            "nbf": now + 3600,
-            "exp": now + 7200,
-        }
-    )
-
-    assert is_github_sponsor_token(expired) is False
-    assert is_github_sponsor_token(wrong_src) is False
-    assert is_github_sponsor_token(wrong_tier) is False
-    assert is_github_sponsor_token(empty_sub) is False
-    assert is_github_sponsor_token(future_nbf) is False
-    assert is_github_sponsor_token("not-a-token") is False
-
-
-def test_github_sponsor_token_rejects_wrong_signature():
-    token = _valid_sponsor_token()
-    alt_key = Ed25519PrivateKey.generate()
-
-    header, payload, _ = token.split(".")
-    forged_signature = alt_key.sign(f"{header}.{payload}".encode("ascii"))
-    forged = (
-        f"{header}.{payload}."
-        f"{base64.urlsafe_b64encode(forged_signature).decode('ascii').rstrip('=')}"
-    )
-
-    assert is_github_sponsor_token(forged) is False
-    assert validate_pro_license_key(forged).reason == "invalid_signature"
-
-
-def test_github_sponsor_token_validation_reasons():
-    now = int(datetime.now(timezone.utc).timestamp())
-    malformed = "not-a-jwt"
-    wrong_issuer = _jwt(
-        {
-            "iss": "other",
-            "sub": "user-1",
-            "src": "github_sponsors",
-            "tier": "pro",
-            "iat": now - 10,
-            "exp": now + 3600,
-        }
-    )
-    expired = _jwt(
-        {
-            "iss": "thermozona",
-            "sub": "user-1",
-            "src": "github_sponsors",
-            "tier": "pro",
-            "iat": now - 7200,
-            "exp": now - 1,
-        }
-    )
-    unknown_kid = _jwt(
-        {
-            "iss": "thermozona",
-            "sub": "user-1",
-            "src": "github_sponsors",
-            "tier": "pro",
-            "iat": now - 10,
-            "exp": now + 3600,
-        },
-        kid="next-rotated-key",
-    )
-    no_kid = _jwt(
-        {
-            "iss": "thermozona",
-            "sub": "user-1",
-            "src": "github_sponsors",
-            "tier": "pro",
-            "iat": now - 10,
-            "exp": now + 3600,
-        },
-        kid=None,
-    )
-
-    assert validate_pro_license_key(malformed).reason == "malformed_token"
-    assert validate_pro_license_key(wrong_issuer).reason == "invalid_issuer"
-    assert validate_pro_license_key(expired).reason == "token_expired"
-    assert validate_pro_license_key(unknown_kid).reason == "unknown_kid"
-    assert validate_pro_license_key(no_kid).is_valid is True
 
 
 def test_auto_mode_and_flow_temperature_calculation_uses_zone_status():
@@ -335,11 +119,10 @@ async def test_flow_temperature_sensor_exposes_breakdown_attributes(fake_hass):
     assert attrs["flow_temp_c"] == pytest.approx(sensor._attr_native_value, abs=0.01)
 
 
-def test_pro_flow_mode_without_license_falls_back_to_simple(fake_hass):
+def test_pro_flow_mode_is_available(fake_hass):
     controller = HeatPumpController(
         fake_hass,
         _config(
-            pro=False,
             flow_mode="pro_supervisor",
         ),
     )
@@ -355,7 +138,8 @@ def test_pro_flow_mode_without_license_falls_back_to_simple(fake_hass):
 
     flow = controller.determine_flow_temperature(HVACMode.HEAT, outside_temp=10)
 
-    assert flow == 25.25
+    assert controller.flow_mode == "pro_supervisor"
+    assert flow > 0
 
 
 def test_pro_flow_supervisor_prioritizes_slow_zones(fake_hass):
@@ -1021,51 +805,51 @@ def test_refresh_entry_config_resets_ui_override(fake_hass):
     assert controller.get_flow_curve_offset() == 0.0
 
 
-def test_free_tier_disables_runtime_flow_curve_override(fake_hass):
-    controller = HeatPumpController(fake_hass, _config(pro=False, flow_curve_offset=2.0))
+def test_runtime_flow_curve_override_is_available(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(flow_curve_offset=2.0))
 
     controller.set_flow_curve_offset(5.0)
 
-    assert controller.get_flow_curve_offset() == 2.0
+    assert controller.get_flow_curve_offset() == 5.0
 
 
-def test_free_tier_falls_back_from_pro_supervisor_flow_mode(fake_hass):
+def test_pro_supervisor_flow_mode_uses_configured_mode(fake_hass):
     controller = HeatPumpController(
         fake_hass,
-        _config(pro=False, flow_mode="pro_supervisor"),
+        _config(flow_mode="pro_supervisor"),
+    )
+
+    assert controller.flow_mode == "pro_supervisor"
+
+
+def test_configured_pro_supervisor_flow_mode_is_used(fake_hass):
+    controller = HeatPumpController(
+        fake_hass,
+        _config(flow_mode="pro_supervisor"),
+    )
+
+    assert controller.flow_mode == "pro_supervisor"
+
+
+def test_flow_mode_defaults_to_simple_when_omitted(fake_hass):
+    controller = HeatPumpController(
+        fake_hass,
+        _config(),
     )
 
     assert controller.flow_mode == "simple"
 
 
-def test_valid_pro_license_allows_pro_supervisor_flow_mode(fake_hass):
-    controller = HeatPumpController(
-        fake_hass,
-        _config(pro=True, flow_mode="pro_supervisor"),
-    )
-
-    assert controller.flow_mode == "pro_supervisor"
-
-
-def test_valid_pro_license_defaults_to_pro_supervisor_when_flow_mode_omitted(fake_hass):
-    controller = HeatPumpController(
-        fake_hass,
-        _config(pro=True),
-    )
-
-    assert controller.flow_mode == "pro_supervisor"
-
-
-def test_free_tier_falls_back_to_manual_heat_mode(fake_hass):
-    controller = HeatPumpController(fake_hass, _config(pro=False))
+def test_controller_keeps_auto_mode(fake_hass):
+    controller = HeatPumpController(fake_hass, _config())
 
     controller.set_mode_value("auto")
 
     assert controller.get_operation_mode() == "auto"
 
 
-def test_free_tier_disables_pwm_control_mode(fake_hass):
-    controller = HeatPumpController(fake_hass, _config(pro=False))
+def test_pwm_control_mode_is_available(fake_hass):
+    controller = HeatPumpController(fake_hass, _config())
     thermostat = ThermozonaThermostat(
         fake_hass,
         "entry-1",
@@ -1083,11 +867,11 @@ def test_free_tier_disables_pwm_control_mode(fake_hass):
         pwm_actuator_delay=3,
     )
 
-    assert thermostat.control_mode == "bang_bang"
+    assert thermostat.control_mode == "pwm"
 
 
-def test_free_tier_select_hides_auto_option(fake_hass):
-    controller = HeatPumpController(fake_hass, _config(pro=False))
+def test_mode_select_options_are_stable(fake_hass):
+    controller = HeatPumpController(fake_hass, _config())
     select = ThermozonaHeatPumpModeSelect(
         "entry-1",
         controller,

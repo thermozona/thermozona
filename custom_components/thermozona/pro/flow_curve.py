@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Jaap van der Meer
-# SPDX-License-Identifier: LicenseRef-Thermozona-Commercial
-"""Sponsor-required runtime flow-curve offset manager."""
+# SPDX-License-Identifier: MIT
+"""Runtime flow-curve offset manager."""
 from __future__ import annotations
 
 import weakref

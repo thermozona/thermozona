@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Jaap van der Meer
-# SPDX-License-Identifier: LicenseRef-Thermozona-Commercial
-"""Sponsor-required flow-temperature supervisor for heating mode."""
+# SPDX-License-Identifier: MIT
+"""Demand-weighted flow-temperature supervisor for heating mode."""
 from __future__ import annotations
 
 import math
