@@ -11,18 +11,15 @@ from homeassistant.components.climate import HVACMode
 
 from . import (
     CONTROL_MODE_PWM,
-    CONF_FLOW_MODE,
     CONF_FLOW_CURVE_OFFSET,
     CONF_FLOW_TEMP_SENSOR,
     CONF_HEAT_PUMP_MODE,
-    CONF_PRO,
+    CONF_FLOW,
     CONF_COOLING_BASE_OFFSET,
     CONF_HEATING_BASE_OFFSET,
-    CONF_PRO_FLOW,
     CONF_PRO_PREHEAT_ENABLED,
     CONF_PRO_PREHEAT_FORECAST_SENSOR,
     CONF_PRO_PREHEAT_SOLAR_SENSOR,
-    CONF_SIMPLE_FLOW,
     CONF_OUTSIDE_TEMP_SENSOR,
     CONF_WEATHER_SLOPE_COOL,
     CONF_WEATHER_SLOPE_HEAT,
@@ -34,13 +31,9 @@ from . import (
     DEFAULT_HEATING_BASE_OFFSET,
     DEFAULT_PRO_WRITE_DEADBAND_C,
     DEFAULT_PRO_WRITE_MIN_INTERVAL_MINUTES,
-    DEFAULT_SIMPLE_WRITE_DEADBAND_C,
-    DEFAULT_SIMPLE_WRITE_MIN_INTERVAL_MINUTES,
     DEFAULT_WEATHER_SLOPE_COOL,
     DEFAULT_WEATHER_SLOPE_HEAT,
     DOMAIN,
-    FLOW_MODE_PRO_SUPERVISOR,
-    FLOW_MODE_SIMPLE,
 )
 from .helpers import resolve_circuits
 from .pro.flow_curve import FlowCurveRuntimeManager
@@ -85,8 +78,6 @@ class HeatPumpController:
         self._mode_select: weakref.ReferenceType[
             ThermozonaHeatPumpModeSelect
         ] | None = None
-        self._flow_mode = FLOW_MODE_SIMPLE
-        self._apply_flow_mode(entry_config.get(CONF_FLOW_MODE))
         self._mode_value: str = "auto"
         self._mode_entity_id: str | None = None
         self._pump_state: str = "idle"
@@ -96,43 +87,13 @@ class HeatPumpController:
             get_yaml_value=self._get_yaml_flow_curve_offset,
             notify_thermostats=lambda: self._notify_thermostats(),
         )
-        self._pro_flow_supervisor = ProFlowSupervisor()
-
-    @property
-    def flow_mode(self) -> str:
-        """Return active flow mode."""
-        return self._flow_mode
-
-    def _apply_flow_mode(
-        self,
-        configured_flow_mode: str | None,
-    ) -> None:
-        """Apply configured flow mode safely."""
-        if configured_flow_mode is None:
-            requested_flow_mode = FLOW_MODE_SIMPLE
-        else:
-            requested_flow_mode = str(configured_flow_mode).lower()
-        if requested_flow_mode not in {FLOW_MODE_SIMPLE, FLOW_MODE_PRO_SUPERVISOR}:
-            _LOGGER.warning(
-                "%s: Unsupported flow_mode '%s'; falling back to '%s'",
-                DOMAIN,
-                requested_flow_mode,
-                FLOW_MODE_SIMPLE,
-            )
-            requested_flow_mode = FLOW_MODE_SIMPLE
-
-        self._flow_mode = requested_flow_mode
+        self._flow_supervisor = ProFlowSupervisor()
 
     def _get_flow_write_settings(self) -> tuple[float, timedelta]:
         """Return deadband and minimum write interval for flow commands."""
-        if self.flow_mode == FLOW_MODE_PRO_SUPERVISOR:
-            config = self._pro_flow_config()
-            deadband_default = DEFAULT_PRO_WRITE_DEADBAND_C
-            min_interval_default = DEFAULT_PRO_WRITE_MIN_INTERVAL_MINUTES
-        else:
-            config = self._entry_config.get(CONF_SIMPLE_FLOW, {})
-            deadband_default = DEFAULT_SIMPLE_WRITE_DEADBAND_C
-            min_interval_default = DEFAULT_SIMPLE_WRITE_MIN_INTERVAL_MINUTES
+        config = self._flow_config()
+        deadband_default = DEFAULT_PRO_WRITE_DEADBAND_C
+        min_interval_default = DEFAULT_PRO_WRITE_MIN_INTERVAL_MINUTES
 
         deadband = max(
             0.0,
@@ -163,12 +124,8 @@ class HeatPumpController:
 
         return False
 
-
-    def _pro_config(self) -> dict[str, Any]:
-        return self._entry_config.get(CONF_PRO, {})
-
-    def _pro_flow_config(self) -> dict[str, Any]:
-        return self._pro_config().get(CONF_PRO_FLOW, {})
+    def _flow_config(self) -> dict[str, Any]:
+        return self._entry_config.get(CONF_FLOW, {})
 
     def _outside_temp_sensor(self) -> str | None:
         return self._entry_config.get(CONF_OUTSIDE_TEMP_SENSOR)
@@ -475,11 +432,11 @@ class HeatPumpController:
 
     def _forecast_outside_temp(self) -> float | None:
         """Return forecasted outside temperature used by optional preheat boost."""
-        pro_flow_config = self._pro_flow_config()
-        if not bool(pro_flow_config.get(CONF_PRO_PREHEAT_ENABLED, False)):
+        flow_config = self._flow_config()
+        if not bool(flow_config.get(CONF_PRO_PREHEAT_ENABLED, False)):
             return None
 
-        forecast_sensor = pro_flow_config.get(CONF_PRO_PREHEAT_FORECAST_SENSOR)
+        forecast_sensor = flow_config.get(CONF_PRO_PREHEAT_FORECAST_SENSOR)
         if not forecast_sensor:
             return None
 
@@ -505,11 +462,11 @@ class HeatPumpController:
 
     def _forecast_solar_irradiance(self) -> float | None:
         """Return forecast solar irradiance used to soften preheat before sun gains."""
-        pro_flow_config = self._pro_flow_config()
-        if not bool(pro_flow_config.get(CONF_PRO_PREHEAT_ENABLED, False)):
+        flow_config = self._flow_config()
+        if not bool(flow_config.get(CONF_PRO_PREHEAT_ENABLED, False)):
             return None
 
-        solar_sensor = pro_flow_config.get(CONF_PRO_PREHEAT_SOLAR_SENSOR)
+        solar_sensor = flow_config.get(CONF_PRO_PREHEAT_SOLAR_SENSOR)
         if not solar_sensor:
             return None
 
@@ -533,129 +490,46 @@ class HeatPumpController:
             )
             return None
 
-    def _determine_simple_flow_temperature(
+    def _determine_cooling_flow_temperature_with_factors(
         self,
         *,
-        effective_mode: HVACMode,
-        outside_temp: float | None,
-        statuses: list[dict[str, Any]],
-    ) -> float:
-        """Return simple flow strategy based on zone targets and weather."""
-        max_target = max(float(status["target"]) for status in statuses)
-        min_target = min(float(status["target"]) for status in statuses)
-
-        if effective_mode == HVACMode.COOL:
-            base_offset = float(
-                self._entry_config.get(
-                    CONF_COOLING_BASE_OFFSET,
-                    DEFAULT_COOLING_BASE_OFFSET,
-                )
-            )
-            slope = float(
-                self._entry_config.get(
-                    CONF_WEATHER_SLOPE_COOL,
-                    DEFAULT_WEATHER_SLOPE_COOL,
-                )
-            )
-            if outside_temp is not None:
-                base_offset += max(0.0, outside_temp - 24.0) * max(0.0, slope)
-            flow = min_target - base_offset - self.get_flow_curve_offset()
-            return max(15.0, min(25.0, flow))
-
-        base_offset = float(
-            self._entry_config.get(
-                CONF_HEATING_BASE_OFFSET,
-                DEFAULT_HEATING_BASE_OFFSET,
-            )
-        )
-        slope = float(
-            self._entry_config.get(
-                CONF_WEATHER_SLOPE_HEAT,
-                DEFAULT_WEATHER_SLOPE_HEAT,
-            )
-        )
-        if outside_temp is not None:
-            base_offset += max(0.0, 15.0 - outside_temp) * max(0.0, slope)
-        flow = max_target + base_offset + self.get_flow_curve_offset()
-        return max(15.0, min(35.0, flow))
-
-    def _determine_simple_flow_temperature_with_factors(
-        self,
-        *,
-        effective_mode: HVACMode,
         outside_temp: float | None,
         statuses: list[dict[str, Any]],
     ) -> tuple[float, dict[str, Any]]:
-        """Return (flow_temp, breakdown) for the simple strategy."""
+        """Return (flow_temp, breakdown) for the cooling curve."""
 
         flow_curve_offset = self.get_flow_curve_offset()
         clamp_min = 15.0
-        clamp_max = 25.0 if effective_mode == HVACMode.COOL else 35.0
+        clamp_max = 25.0
 
-        max_target = max(float(status["target"]) for status in statuses)
         min_target = min(float(status["target"]) for status in statuses)
-
-        if effective_mode == HVACMode.COOL:
-            base_offset = float(
-                self._entry_config.get(
-                    CONF_COOLING_BASE_OFFSET,
-                    DEFAULT_COOLING_BASE_OFFSET,
-                )
-            )
-            slope = float(
-                self._entry_config.get(
-                    CONF_WEATHER_SLOPE_COOL,
-                    DEFAULT_WEATHER_SLOPE_COOL,
-                )
-            )
-            weather_comp = 0.0
-            if outside_temp is not None:
-                weather_comp = max(0.0, outside_temp - 24.0) * max(0.0, slope)
-
-            effective_base_offset = base_offset + weather_comp
-            unclamped = min_target - effective_base_offset - flow_curve_offset
-            flow = max(clamp_min, min(clamp_max, unclamped))
-            return (
-                flow,
-                {
-                    "target_ref_c": round(min_target, 3),
-                    "base_offset_c": round(base_offset, 3),
-                    "weather_slope": round(slope, 6),
-                    "weather_comp_c": round(weather_comp, 3),
-                    "effective_base_offset_c": round(effective_base_offset, 3),
-                    "flow_curve_offset_c": round(flow_curve_offset, 3),
-                    "flow_temp_unclamped_c": round(unclamped, 3),
-                    "flow_temp_c": round(flow, 1),
-                    "clamp_min_c": clamp_min,
-                    "clamp_max_c": clamp_max,
-                },
-            )
 
         base_offset = float(
             self._entry_config.get(
-                CONF_HEATING_BASE_OFFSET,
-                DEFAULT_HEATING_BASE_OFFSET,
+                CONF_COOLING_BASE_OFFSET,
+                DEFAULT_COOLING_BASE_OFFSET,
             )
         )
         slope = float(
             self._entry_config.get(
-                CONF_WEATHER_SLOPE_HEAT,
-                DEFAULT_WEATHER_SLOPE_HEAT,
+                CONF_WEATHER_SLOPE_COOL,
+                DEFAULT_WEATHER_SLOPE_COOL,
             )
         )
         weather_comp = 0.0
         if outside_temp is not None:
-            weather_comp = max(0.0, 15.0 - outside_temp) * max(0.0, slope)
-        unclamped = max_target + base_offset + weather_comp + flow_curve_offset
+            weather_comp = max(0.0, outside_temp - 24.0) * max(0.0, slope)
+        effective_base_offset = base_offset + weather_comp
+        unclamped = min_target - effective_base_offset - flow_curve_offset
         flow = max(clamp_min, min(clamp_max, unclamped))
         return (
             flow,
             {
-                "target_ref_c": round(max_target, 3),
+                "target_ref_c": round(min_target, 3),
                 "base_offset_c": round(base_offset, 3),
                 "weather_slope": round(slope, 6),
                 "weather_comp_c": round(weather_comp, 3),
-                "effective_base_offset_c": round(base_offset + weather_comp, 3),
+                "effective_base_offset_c": round(effective_base_offset, 3),
                 "flow_curve_offset_c": round(flow_curve_offset, 3),
                 "flow_temp_unclamped_c": round(unclamped, 3),
                 "flow_temp_c": round(flow, 1),
@@ -664,45 +538,12 @@ class HeatPumpController:
             },
         )
 
-    def _determine_pro_heating_flow_temperature(
-        self,
-        *,
-        outside_temp: float | None,
-    ) -> float:
-        """Return Pro flow strategy for heating with demand-weighted supervision."""
-        base_offset = float(
-            self._entry_config.get(
-                CONF_HEATING_BASE_OFFSET,
-                DEFAULT_HEATING_BASE_OFFSET,
-            )
-        )
-        weather_slope = float(
-            self._entry_config.get(
-                CONF_WEATHER_SLOPE_HEAT,
-                DEFAULT_WEATHER_SLOPE_HEAT,
-            )
-        )
-        pro_flow_config = self._pro_flow_config()
-        forecast_outside_temp = self._forecast_outside_temp()
-        forecast_solar_irradiance = self._forecast_solar_irradiance()
-        flow = self._pro_flow_supervisor.compute_heating_flow(
-            zone_status=self._zone_status,
-            outside_temp=outside_temp,
-            forecast_outside_temp=forecast_outside_temp,
-            forecast_solar_irradiance=forecast_solar_irradiance,
-            base_offset=base_offset,
-            weather_slope=weather_slope,
-            flow_curve_offset=self.get_flow_curve_offset(),
-            config=pro_flow_config,
-        )
-        return max(15.0, min(35.0, flow))
-
-    def _determine_pro_heating_flow_temperature_with_factors(
+    def _determine_supervised_heating_flow_temperature_with_factors(
         self,
         *,
         outside_temp: float | None,
     ) -> tuple[float, dict[str, Any]]:
-        """Return (flow_temp, breakdown) for the Pro supervisor heating strategy."""
+        """Return (flow_temp, breakdown) for the supervisor heating strategy."""
 
         base_offset = float(
             self._entry_config.get(
@@ -716,11 +557,11 @@ class HeatPumpController:
                 DEFAULT_WEATHER_SLOPE_HEAT,
             )
         )
-        pro_flow_config = self._pro_flow_config()
+        flow_config = self._flow_config()
         forecast_outside_temp = self._forecast_outside_temp()
         forecast_solar_irradiance = self._forecast_solar_irradiance()
 
-        flow, breakdown = self._pro_flow_supervisor.compute_heating_flow_with_breakdown(
+        flow, breakdown = self._flow_supervisor.compute_heating_flow_with_breakdown(
             zone_status=self._zone_status,
             outside_temp=outside_temp,
             forecast_outside_temp=forecast_outside_temp,
@@ -728,7 +569,7 @@ class HeatPumpController:
             base_offset=base_offset,
             weather_slope=weather_slope,
             flow_curve_offset=self.get_flow_curve_offset(),
-            config=pro_flow_config,
+            config=flow_config,
         )
 
         breakdown.update(
@@ -761,7 +602,6 @@ class HeatPumpController:
         mode_value = effective_mode.value if hasattr(effective_mode, "value") else str(effective_mode)
         common: dict[str, Any] = {
             "effective_mode": str(mode_value),
-            "flow_mode": self.flow_mode,
             "outside_temp_c": None if outside_temp is None else round(float(outside_temp), 3),
         }
 
@@ -781,23 +621,14 @@ class HeatPumpController:
             return default_flow, breakdown
 
         if effective_mode == HVACMode.COOL:
-            flow, breakdown = self._determine_simple_flow_temperature_with_factors(
-                effective_mode=effective_mode,
+            flow, breakdown = self._determine_cooling_flow_temperature_with_factors(
                 outside_temp=outside_temp,
                 statuses=statuses,
             )
             return flow, {**common, **breakdown}
 
-        if self.flow_mode == FLOW_MODE_PRO_SUPERVISOR:
-            flow, breakdown = self._determine_pro_heating_flow_temperature_with_factors(
-                outside_temp=outside_temp,
-            )
-            return flow, {**common, **breakdown}
-
-        flow, breakdown = self._determine_simple_flow_temperature_with_factors(
-            effective_mode=effective_mode,
+        flow, breakdown = self._determine_supervised_heating_flow_temperature_with_factors(
             outside_temp=outside_temp,
-            statuses=statuses,
         )
         return flow, {**common, **breakdown}
 
@@ -972,8 +803,7 @@ class HeatPumpController:
     def refresh_entry_config(self, entry_config: dict[str, Any]) -> None:
         """Update internal reference to the config entry (for reload scenarios)."""
         self._entry_config = entry_config
-        self._apply_flow_mode(entry_config.get(CONF_FLOW_MODE))
-        self._pro_flow_supervisor.reset()
+        self._flow_supervisor.reset()
         self._last_flow_write_temp = None
         self._last_flow_write_time = None
         self.reset_flow_curve_offset()

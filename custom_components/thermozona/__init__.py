@@ -21,12 +21,9 @@ CONF_HEAT_PUMP_MODE = "heat_pump_mode"
 CONF_HEATING_BASE_OFFSET = "heating_base_offset"
 CONF_COOLING_BASE_OFFSET = "cooling_base_offset"
 CONF_FLOW_CURVE_OFFSET = "flow_curve_offset"
-CONF_FLOW_MODE = "flow_mode"
 CONF_WEATHER_SLOPE_HEAT = "weather_slope_heat"
 CONF_WEATHER_SLOPE_COOL = "weather_slope_cool"
-CONF_SIMPLE_FLOW = "simple_flow"
-CONF_PRO = "pro"
-CONF_PRO_FLOW = "flow"
+CONF_FLOW = "flow"
 CONF_WRITE_DEADBAND_C = "write_deadband_c"
 CONF_WRITE_MIN_INTERVAL_MINUTES = "write_min_interval_minutes"
 CONF_PRO_KP = "kp"
@@ -64,19 +61,14 @@ CONF_ZONE_SOLAR_WEIGHT = "zone_solar_weight"
 
 CONTROL_MODE_BANG_BANG = "bang_bang"
 CONTROL_MODE_PWM = "pwm"
-FLOW_MODE_SIMPLE = "simple"
-FLOW_MODE_PRO_SUPERVISOR = "pro_supervisor"
 ZONE_RESPONSE_SLOW = "slow"
 ZONE_RESPONSE_FAST = "fast"
 
 DEFAULT_HEATING_BASE_OFFSET = 3.0
 DEFAULT_COOLING_BASE_OFFSET = 2.5
 DEFAULT_FLOW_CURVE_OFFSET = 0.0
-DEFAULT_FLOW_MODE = FLOW_MODE_SIMPLE
 DEFAULT_WEATHER_SLOPE_HEAT = 0.25
 DEFAULT_WEATHER_SLOPE_COOL = 0.2
-DEFAULT_SIMPLE_WRITE_DEADBAND_C = 0.5
-DEFAULT_SIMPLE_WRITE_MIN_INTERVAL_MINUTES = 15
 DEFAULT_PRO_KP = 1.0
 DEFAULT_PRO_USE_INTEGRAL = False
 DEFAULT_PRO_TI_MINUTES = 180
@@ -114,20 +106,7 @@ DEFAULT_PWM_KP = 30.0
 DEFAULT_PWM_KI = 2.0
 DEFAULT_PWM_ACTUATOR_DELAY = 3
 
-SIMPLE_FLOW_SCHEMA = vol.Schema(
-    {
-        vol.Optional(
-            CONF_WRITE_DEADBAND_C,
-            default=DEFAULT_SIMPLE_WRITE_DEADBAND_C,
-        ): vol.All(vol.Coerce(float), vol.Range(min=0, max=5)),
-        vol.Optional(
-            CONF_WRITE_MIN_INTERVAL_MINUTES,
-            default=DEFAULT_SIMPLE_WRITE_MIN_INTERVAL_MINUTES,
-        ): vol.All(vol.Coerce(int), vol.Range(min=1, max=120)),
-    }
-)
-
-PRO_FLOW_SCHEMA = vol.Schema(
+FLOW_SCHEMA = vol.Schema(
     {
         vol.Optional(
             CONF_PRO_KP,
@@ -228,15 +207,6 @@ PRO_FLOW_SCHEMA = vol.Schema(
     }
 )
 
-PRO_SCHEMA = vol.Schema(
-    {
-        vol.Optional(
-            CONF_PRO_FLOW,
-            default={},
-        ): PRO_FLOW_SCHEMA,
-    }
-)
-
 ZONE_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_CIRCUITS): [cv.entity_id],
@@ -306,9 +276,6 @@ CONFIG_SCHEMA = vol.Schema({
             default=DEFAULT_FLOW_CURVE_OFFSET,
         ): vol.Coerce(float),
         vol.Optional(
-            CONF_FLOW_MODE,
-        ): vol.In([FLOW_MODE_SIMPLE, FLOW_MODE_PRO_SUPERVISOR]),
-        vol.Optional(
             CONF_WEATHER_SLOPE_HEAT,
             default=DEFAULT_WEATHER_SLOPE_HEAT,
         ): vol.Coerce(float),
@@ -317,13 +284,9 @@ CONFIG_SCHEMA = vol.Schema({
             default=DEFAULT_WEATHER_SLOPE_COOL,
         ): vol.Coerce(float),
         vol.Optional(
-            CONF_SIMPLE_FLOW,
+            CONF_FLOW,
             default={},
-        ): SIMPLE_FLOW_SCHEMA,
-        vol.Optional(
-            CONF_PRO,
-            default={},
-        ): PRO_SCHEMA,
+        ): FLOW_SCHEMA,
         vol.Required(CONF_ZONES): {
             cv.string: ZONE_SCHEMA
         }

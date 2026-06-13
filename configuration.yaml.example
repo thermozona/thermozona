@@ -57,18 +57,16 @@ input_boolean:
 # Safety notice: Use at your own risk; ensure code-compliant installation/wiring. Authors/contributors are not liable for damage, injury, or fire.
 thermozona:
   outside_temp_sensor: sensor.test_buiten_temperatuur
-  # flow_mode: simple  # Optional override: simple or pro_supervisor
   # heating_base_offset: 3.0
   # weather_slope_heat: 0.25
 
-  # Optional advanced flow-supervisor tuning.
+  # Optional flow calculation tuning.
   # Keep it small here; see README for the full tuning matrix.
-  pro:
-    flow:
-      # preheat_enabled: true
-      # preheat_forecast_sensor: sensor.outdoor_forecast_2h
-      # preheat_solar_sensor: sensor.solar_irradiance_forecast_2h
-      # preheat_solar_gain_per_w_m2: 0.002
+  flow:
+    # preheat_enabled: true
+    # preheat_forecast_sensor: sensor.outdoor_forecast_2h
+    # preheat_solar_sensor: sensor.solar_irradiance_forecast_2h
+    # preheat_solar_gain_per_w_m2: 0.002
 
   zones:
     woonkamer:
