@@ -21,6 +21,7 @@ from . import (
     CONF_COOLING_DEWPOINT_MARGIN,
     CONF_COOLING_DEWPOINT_SENSOR,
     CONF_COOLING_FLOOR_DEWPOINT_MARGIN,
+    CONF_DEMAND_OFF_DELAY_MINUTES,
     CONF_FLOW_CURVE_OFFSET,
     CONF_FLOW_TEMP_SENSOR,
     CONF_HEAT_PUMP_MODE,
@@ -33,6 +34,7 @@ from . import (
     CONF_PRO_PREHEAT_SOLAR_SENSOR,
     CONF_OUTSIDE_TEMP_SENSOR,
     CONF_PRICE_CHARGING,
+    CONF_PWM_STAGGERING,
     CONF_HOT_WATER,
     CONF_WEATHER_SLOPE_COOL,
     CONF_WEATHER_SLOPE_HEAT,
@@ -44,6 +46,7 @@ from . import (
     DEFAULT_COOLING_AIR_COIL_ONLY_OFFSET,
     DEFAULT_COOLING_DEHUMIDIFICATION_MIN_FLOW,
     DEFAULT_COOLING_FLOOR_DEWPOINT_MARGIN,
+    DEFAULT_DEMAND_OFF_DELAY_MINUTES,
     DEFAULT_AUTO_COOL_LOCKOUT_BELOW_C,
     DEFAULT_AUTO_HEAT_LOCKOUT_ABOVE_C,
     DEFAULT_AUTO_MIN_CHANGEOVER_MINUTES,
@@ -51,6 +54,7 @@ from . import (
     DEFAULT_HEATING_BASE_OFFSET,
     DEFAULT_PRO_WRITE_DEADBAND_C,
     DEFAULT_PRO_WRITE_MIN_INTERVAL_MINUTES,
+    DEFAULT_PWM_STAGGERING,
     DEFAULT_WEATHER_SLOPE_COOL,
     DEFAULT_WEATHER_SLOPE_HEAT,
     DOMAIN,
@@ -117,7 +121,7 @@ class HeatPumpController:
         self._mode_entity_id: str | None = None
         self._pump_state: str = "idle"
         self._last_any_circuit_on: datetime | None = None
-        self._demand_off_delay = timedelta(minutes=5)
+        self._all_circuits_off_since: datetime | None = None
         self._demand_off_task: asyncio.Task | None = None
         self._shutting_down = False
         self._startup_guard_enabled = False
@@ -136,6 +140,13 @@ class HeatPumpController:
         self.price_charging.excluded_windows = lambda: (
             self.hot_water.reserved_windows() if self.hot_water is not None else []
         )
+
+    @property
+    def _demand_off_delay(self) -> timedelta:
+        """Return the configured hold after the final circuit closes."""
+        return timedelta(minutes=self._entry_config.get(
+            CONF_DEMAND_OFF_DELAY_MINUTES, DEFAULT_DEMAND_OFF_DELAY_MINUTES
+        ))
 
     @property
     def space_heating_suspended(self) -> bool:
@@ -1250,13 +1261,16 @@ class HeatPumpController:
         self._thermostats.discard(thermostat)
 
     def get_pwm_zone_info(self, thermostat: ThermozonaThermostat) -> tuple[int, int]:
-        """Return deterministic PWM staggering index and active PWM zone count."""
+        """Return PWM alignment: staggered by default, shared when configured."""
         if getattr(thermostat, "control_mode", None) != CONTROL_MODE_PWM:
             return (0, 0)
 
         zone_index = self._pwm_zone_indices.get(thermostat)
         if zone_index is None:
             return (0, 0)
+
+        if not self._entry_config.get(CONF_PWM_STAGGERING, DEFAULT_PWM_STAGGERING):
+            return (0, 1)
 
         zone_count = sum(
             1
@@ -1281,11 +1295,13 @@ class HeatPumpController:
         """Update the heat pump switch and flow temperature based on circuit state."""
         if self._shutting_down:
             self._last_any_circuit_on = None
+            self._all_circuits_off_since = None
             self._update_pump_status(False, None)
             self._mark_flow_command_inactive()
             return
         if self.space_heating_suspended:
             self._last_any_circuit_on = None
+            self._all_circuits_off_since = None
             self._update_pump_status(False, None)
             self._mark_flow_command_inactive()
             return
@@ -1308,41 +1324,49 @@ class HeatPumpController:
                     self._demand_off_task.cancel()
                     self._demand_off_task = None
                 self._last_any_circuit_on = now
+                self._all_circuits_off_since = None
                 effective_mode = await self._async_set_flow_temperature()
                 self._update_pump_status(True, effective_mode)
                 if effective_mode is None:
                     self._mark_flow_command_inactive()
-            elif (
+                return
+
+            if (
                 not force_idle
                 and self.get_operation_mode() != "off"
                 and self._last_any_circuit_on is not None
-                and now - self._last_any_circuit_on < self._demand_off_delay
             ):
-                _LOGGER.debug(
-                    "%s: All circuits off, but within %s delay — keeping demand",
-                    DOMAIN,
-                    self._demand_off_delay,
-                )
-                self._schedule_demand_off_recheck(now)
-            else:
-                if self._demand_off_task is not None:
-                    self._demand_off_task.cancel()
-                    self._demand_off_task = None
-                self._last_any_circuit_on = None
-                self._update_pump_status(False, None)
-                self._mark_flow_command_inactive()
+                if self._all_circuits_off_since is None:
+                    self._all_circuits_off_since = now
+                if now - self._all_circuits_off_since < self._demand_off_delay:
+                    _LOGGER.debug(
+                        "%s: All circuits off, but within %s delay — keeping demand",
+                        DOMAIN,
+                        self._demand_off_delay,
+                    )
+                    self._schedule_demand_off_recheck(now)
+                    return
+
+            if self._demand_off_task is not None:
+                self._demand_off_task.cancel()
+                self._demand_off_task = None
+            self._last_any_circuit_on = None
+            self._all_circuits_off_since = None
+            self._update_pump_status(False, None)
+            self._mark_flow_command_inactive()
         except Exception as exc:  # pragma: no cover - defensive logging
             _LOGGER.error("%s: Error updating heat pump state: %s", DOMAIN, exc)
             self._last_any_circuit_on = None
+            self._all_circuits_off_since = None
             self._update_pump_status(False, None)
             self._mark_flow_command_inactive()
 
     def _schedule_demand_off_recheck(self, now: datetime) -> None:
         """Re-evaluate when the demand off-delay expires."""
-        if self._last_any_circuit_on is None or self._demand_off_task is not None:
+        if self._all_circuits_off_since is None or self._demand_off_task is not None:
             return
 
-        remaining = self._demand_off_delay - (now - self._last_any_circuit_on)
+        remaining = self._demand_off_delay - (now - self._all_circuits_off_since)
         delay_seconds = max(1.0, remaining.total_seconds())
 
         async def _recheck() -> None:
@@ -1499,6 +1523,7 @@ class HeatPumpController:
 
         self._zone_status.clear()
         self._last_any_circuit_on = None
+        self._all_circuits_off_since = None
         self._update_pump_status(False, None)
         self._mark_flow_command_inactive()
 

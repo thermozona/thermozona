@@ -64,6 +64,8 @@ CONF_PWM_MIN_OFF_TIME = "pwm_min_off_time"
 CONF_PWM_KP = "pwm_kp"
 CONF_PWM_KI = "pwm_ki"
 CONF_PWM_ACTUATOR_DELAY = "pwm_actuator_delay"
+CONF_PWM_STAGGERING = "pwm_staggering"
+CONF_DEMAND_OFF_DELAY_MINUTES = "demand_off_delay_minutes"
 CONF_ZONE_RESPONSE = "zone_response"
 CONF_ZONE_FLOW_WEIGHT = "zone_flow_weight"
 CONF_ZONE_HEATING_MIN_FLOW = "heating_min_flow_c"
@@ -146,6 +148,8 @@ DEFAULT_PWM_MIN_OFF_TIME = 3
 DEFAULT_PWM_KP = 30.0
 DEFAULT_PWM_KI = 2.0
 DEFAULT_PWM_ACTUATOR_DELAY = 3
+DEFAULT_PWM_STAGGERING = True
+DEFAULT_DEMAND_OFF_DELAY_MINUTES = 5.0
 
 FLOW_SCHEMA = vol.Schema(
     {
@@ -384,6 +388,12 @@ CONFIG_SCHEMA = vol.Schema({
         vol.Required(CONF_OUTSIDE_TEMP_SENSOR): cv.entity_id,
         vol.Optional(CONF_FLOW_TEMP_SENSOR): cv.entity_id,
         vol.Optional(CONF_HEAT_PUMP_MODE): cv.entity_id,
+        vol.Optional(
+            CONF_PWM_STAGGERING, default=DEFAULT_PWM_STAGGERING
+        ): cv.boolean,
+        vol.Optional(
+            CONF_DEMAND_OFF_DELAY_MINUTES, default=DEFAULT_DEMAND_OFF_DELAY_MINUTES
+        ): vol.All(vol.Coerce(_finite_float), vol.Range(min=0, max=30)),
         vol.Optional(
             CONF_HEATING_BASE_OFFSET,
             default=DEFAULT_HEATING_BASE_OFFSET,

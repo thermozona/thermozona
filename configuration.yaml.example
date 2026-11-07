@@ -62,6 +62,10 @@ thermozona:
   # auto_heat_lockout_above_c: 18.0
   # auto_cool_lockout_below_c: 20.0
   # auto_min_changeover_minutes: 30
+  # Optional shared PWM windows for a heat pump with small zone loads.
+  # Give participating PWM zones the same pwm_cycle_time, e.g. 30 minutes.
+  # pwm_staggering: false
+  # demand_off_delay_minutes: 0
 
   # Optional Tibber-based house charging: inspect the plan before choosing auto.
   # price_charging:

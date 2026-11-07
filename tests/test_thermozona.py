@@ -123,6 +123,25 @@ def test_resolve_circuits_supports_new_and_legacy_keys():
     assert resolve_circuits({}) == []
 
 
+def test_schema_accepts_shared_pwm_and_configurable_demand_hold():
+    defaults = thermozona.CONFIG_SCHEMA({"thermozona": _config()})["thermozona"]
+    assert defaults["pwm_staggering"] is True
+    assert defaults["demand_off_delay_minutes"] == 5
+    configured = thermozona.CONFIG_SCHEMA({
+        "thermozona": _config(pwm_staggering=False, demand_off_delay_minutes=1)
+    })["thermozona"]
+    assert configured["pwm_staggering"] is False
+    assert configured["demand_off_delay_minutes"] == 1
+
+
+@pytest.mark.parametrize("delay", [-1, 31, "nan", "inf"])
+def test_schema_rejects_invalid_demand_hold(delay):
+    with pytest.raises(vol.Invalid):
+        thermozona.CONFIG_SCHEMA({
+            "thermozona": _config(demand_off_delay_minutes=delay)
+        })
+
+
 def test_schema_accepts_zone_and_cooling_options():
     config = _config(
         flow={
@@ -952,6 +971,88 @@ async def test_demand_off_delay_expires_without_another_zone_update(fake_hass, m
     assert controller._last_flow_factors["command_active"] is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["heat", "cool"])
+async def test_zero_demand_hold_stops_only_after_the_last_circuit_closes(fake_hass, mode):
+    config = _config(demand_off_delay_minutes=0, heat_pump_mode="sensor.mode")
+    config["zones"]["other"] = {"circuits": ["switch.other"]}
+    controller = HeatPumpController(fake_hass, config)
+    fake_hass.states.set("sensor.mode", mode)
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("switch.zone_1", "on")
+    fake_hass.states.set("switch.other", "on")
+    controller.update_zone_status("living", target=21, current=19, active=True)
+    await controller.async_update_heat_pump_state()
+    assert controller._pump_state == mode
+
+    fake_hass.states.set("switch.zone_1", "off")
+    await controller.async_update_heat_pump_state()
+    assert controller._pump_state == mode
+
+    fake_hass.states.set("switch.other", "off")
+    await controller.async_update_heat_pump_state()
+    assert controller._pump_state == "idle"
+    assert controller._demand_off_task is None
+    assert controller._last_flow_factors["command_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_demand_hold_starts_at_closure_and_cancels_on_new_demand(fake_hass, monkeypatch):
+    clock = SimpleNamespace(now=datetime(2026, 11, 7, 12, tzinfo=timezone.utc))
+    monkeypatch.setattr(
+        heat_pump_module, "datetime", SimpleNamespace(now=lambda _tz: clock.now)
+    )
+    controller = HeatPumpController(fake_hass, _config(demand_off_delay_minutes=1))
+    controller.set_mode_value("heat")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("switch.zone_1", "on")
+    controller.update_zone_status("living", target=21, current=19, active=True)
+    await controller.async_update_heat_pump_state()
+    clock.now += timedelta(minutes=2)
+    fake_hass.states.set("switch.zone_1", "off")
+    await controller.async_update_heat_pump_state()
+    task = controller._demand_off_task
+    assert task is not None
+    assert controller._pump_state == "heat"
+    assert controller._all_circuits_off_since == clock.now
+
+    clock.now += timedelta(seconds=30)
+    await controller.async_update_heat_pump_state()
+    assert controller._demand_off_task is task
+    assert controller._pump_state == "heat"
+    fake_hass.states.set("switch.zone_1", "on")
+    await controller.async_update_heat_pump_state()
+    await asyncio.sleep(0)
+    assert task.cancelled()
+    assert controller._demand_off_task is None
+    assert controller._all_circuits_off_since is None
+    assert controller._pump_state == "heat"
+
+    fake_hass.states.set("switch.zone_1", "off")
+    await controller.async_update_heat_pump_state()
+    task = controller._demand_off_task
+    clock.now += timedelta(minutes=1)
+    await controller.async_update_heat_pump_state()
+    await asyncio.sleep(0)
+    assert task.cancelled()
+    assert controller._pump_state == "idle"
+    assert controller._all_circuits_off_since is None
+
+
+@pytest.mark.asyncio
+async def test_demand_hold_does_not_delay_explicit_shutdown(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(demand_off_delay_minutes=1))
+    controller.set_mode_value("heat")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("switch.zone_1", "on")
+    controller.update_zone_status("living", target=21, current=19, active=True)
+    await controller.async_update_heat_pump_state()
+    fake_hass.states.set("switch.zone_1", "off")
+    await controller.async_update_heat_pump_state(force_idle=True)
+    assert controller._pump_state == "idle"
+    assert controller._demand_off_task is None
+
+
 def test_name_helpers_cover_slugify_and_prettify():
     assert ThermozonaThermostat._prettify("living_room-main") == "Living room main"
     assert ThermozonaThermostat._slugify("Living Room Main!") == "living_room_main"
@@ -1522,6 +1623,31 @@ async def test_pwm_stagger_offset_produces_different_cycle_starts(fake_hass):
     start_b = zone_b._get_aligned_pwm_cycle_start(now)
 
     assert start_a != start_b
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [HVACMode.HEAT, HVACMode.COOL])
+async def test_shared_pwm_aligns_zones_without_changing_duty(fake_hass, mode):
+    controller = HeatPumpController(fake_hass, _config(pwm_staggering=False))
+    zone_a = _create_pwm_thermostat(fake_hass, controller)
+    zone_b = _create_pwm_thermostat(fake_hass, controller)
+    controller.register_thermostat(zone_a)
+    controller.register_thermostat(zone_b)
+    now = datetime(2026, 11, 7, 12, tzinfo=timezone.utc)
+    start_a = zone_a._get_aligned_pwm_cycle_start(now)
+    start_b = zone_b._get_aligned_pwm_cycle_start(now)
+    assert start_a == start_b == now
+    zone_a._calculate_pwm_duty = Mock(return_value=20)
+    zone_b._calculate_pwm_duty = Mock(return_value=60)
+    for zone in [zone_a, zone_b]:
+        zone._start_new_pwm_cycle(20, mode, now, now, False)
+    assert zone_a._pwm_on_time == timedelta(minutes=6)
+    assert zone_b._pwm_on_time == timedelta(minutes=12)
+    assert zone_a._attr_target_temperature == 20
+    assert zone_b._attr_target_temperature == 20
+
+    controller.refresh_entry_config(_config(pwm_staggering=True))
+    assert zone_a._get_aligned_pwm_cycle_start(now) != zone_b._get_aligned_pwm_cycle_start(now)
 
 
 @pytest.mark.asyncio

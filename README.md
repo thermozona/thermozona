@@ -187,6 +187,8 @@ thermozona:
 | `zones` | Yes | none | Mapping of zone names to temperature sensors and circuit outputs. |
 | `flow_temp_sensor` | No | internal number entity | Optional external `input_number` target for the calculated flow temperature. |
 | `heat_pump_mode` | No | internal select entity | Optional external entity for heat/cool/auto/off mode. |
+| `pwm_staggering` | No | `true` | Spread PWM zones over their cycles. Set `false` and use the same cycle length to group zone demand into shared heating/cooling windows. |
+| `demand_off_delay_minutes` | No | `5` | Hold shared demand after the final circuit closes, range `0` to `30`. Set `0` to release demand immediately; the heat pump retains its native pump run-on and protections. |
 | `heating_base_offset` | No | `3.0` | Base degrees added above the warmest active target in heating. |
 | `cooling_base_offset` | No | `2.5` | Base degrees subtracted below the coolest active target in cooling. |
 | `flow_curve_offset` | No | `0.0` | Baseline offset applied to both heating and cooling flow calculations. |
@@ -385,6 +387,8 @@ This is the default. Thermozona turns circuit outputs on when the room needs hea
 ### `control_mode: pwm`
 
 PWM mode calculates a 0-100% duty cycle each cycle. It is useful for high thermal-mass floors where plain on/off control overshoots.
+
+For a shared heat pump with small zone loads, staggered pulses can keep circulation active nearly continuously. Set `pwm_staggering: false` at the `thermozona` level and use a common `pwm_cycle_time` (for example, 30 minutes) to open demanding zones together. Each zone retains its own PI duty and on-time; grouping does not increase room targets or force satisfied zones open. `demand_off_delay_minutes: 0` also removes the additional demand hold after all circuits close. These options apply to both heating and cooling; existing mode, sensor, hot-water and dew-point interlocks still apply. They do not force a compressor minimum runtime or override native circulation settings. Check actual compressor cycles and room comfort after changing them.
 
 Example:
 

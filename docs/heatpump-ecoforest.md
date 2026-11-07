@@ -2,6 +2,8 @@
 
 This guide shows how to pair an Ecoforest heat pump with Thermozona using Home Assistant's Modbus integration. Adapt the IP address, slave IDs, and register ranges to match your own unit.
 
+For a complete coordinated mode/setpoint automation, use [ecoforest-demand.yaml](ecoforest-demand.yaml) instead of the separate illustrative automations below. It checks active commands, stops before changing direction, writes the setpoint before enabling demand, and reconciles readback every five minutes. Its state triggers ignore diagnostic attribute updates and explicitly watch `command_active` and `effective_mode`; this prevents routine diagnostic updates from filling the Modbus automation queue.
+
 > Safety notice: This setup is used at your own risk. You are responsible for safe installation and code-compliant wiring/configuration; the project authors and contributors are not liable for damage, injury, equipment failure, or fire.
 
 
@@ -109,6 +111,35 @@ automation:
 ```
 
 If you prefer to log or visualise the values, add extra actions (e.g. `system_log.write`) inside the sequences.
+
+## Group small zone loads to reduce circulation
+
+The Ecoforest can keep its production pump running while register 5224 requests heat, even when the compressor is off because the water is already warm. Staggered PWM zone pulses and a demand hold between pulses can make that request nearly continuous.
+
+For a shared installation with small zone loads, group PWM zones onto the same clock and cycle length:
+
+```yaml
+thermozona:
+  pwm_staggering: false
+  demand_off_delay_minutes: 1
+  zones:
+    living_room:
+      circuits:
+        - switch.manifold_living
+      temp_sensor: sensor.living_room
+      control_mode: pwm
+      pwm_cycle_time: 30
+    bathroom:
+      circuits:
+        - switch.manifold_bathroom
+      temp_sensor: sensor.bathroom
+      control_mode: pwm
+      pwm_cycle_time: 30
+```
+
+Each zone keeps its own PI duty and on-time. Zones that need heat open together, providing a larger simultaneous load and leaving longer periods without demand. The one-minute hold starts when the last circuit closes, bridges brief relay transitions, and then lets the existing Modbus automation release register 5224. It is not a compressor minimum-runtime setting. Default installations retain staggered PWM and a five-minute demand hold.
+
+Do not use compressor RPM alone to disable circulation: active demand can need circulation before a compressor start or while transferring residual heat. Native pump control, compressor protections and DHW priority remain in charge. After changing the coordination, compare measured pump power, starts, run durations and room temperatures over several days. Grouping cannot guarantee longer compressor runs when a single small zone remains the only load.
 
 ## 4. Wire Thermozona to the Ecoforest entities
 
