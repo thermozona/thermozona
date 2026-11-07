@@ -371,6 +371,7 @@ HOT_WATER_SCHEMA = vol.Schema({
         "last_off_entity", "started_at_entity",
     )},
     vol.Optional("grid_sensor"): cv.entity_id,
+    vol.Optional("active_sensors", default=[]): [cv.entity_id],
     vol.Required("start_service"): cv.string,
     vol.Required("stop_service"): cv.string,
     vol.Optional("start_data", default={}): dict,

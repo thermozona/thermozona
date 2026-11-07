@@ -8,6 +8,7 @@ import math
 from typing import Any
 
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_state_change_event
 
 from .price_charging import ChargeWindow, PriceChargingManager, average_price
 
@@ -17,8 +18,8 @@ _LOGGER = logging.getLogger(__name__)
 class HotWaterManager(PriceChargingManager):
     """Schedule an optional one-hour boost without replacing native water heating."""
 
-    def __init__(self, hass, config: dict[str, Any]) -> None:
-        super().__init__(hass, config, lambda: None)
+    def __init__(self, hass, config: dict[str, Any], notify=lambda: None) -> None:
+        super().__init__(hass, config, notify)
         self.mode = config.get("mode", "monitor")
         self._prices = PriceChargingManager(hass, {"mode": "preview"}, lambda: None)
         self._owned = False
@@ -26,6 +27,38 @@ class HotWaterManager(PriceChargingManager):
         self._requested_at = None
         self._surplus_since = None
         self._import_since = None
+        self._remove_state_listener = None
+
+    @property
+    def blocks_space_heating(self) -> bool:
+        """Keep the shared heat pump available to requested or native water heating."""
+        demand = self._state("demand_entity")
+        if self._owned or demand is None or demand.state != "off":
+            return True
+        for entity_id in self._config.get("active_sensors", []):
+            state = self._hass.states.get(entity_id)
+            if state is None or state.state not in {"off", "0", "0.0"}:
+                return True
+        return False
+
+    def reserved_windows(self):
+        """Reserve the boiler block with allowance for the minimum runtime."""
+        if self.mode == "auto" and self.window is not None:
+            return [(self.window.start, self.window.end + timedelta(minutes=15))]
+        return []
+
+    async def async_start(self) -> None:
+        """React immediately to native heat-pump and request state changes."""
+        self._remove_state_listener = async_track_state_change_event(
+            self._hass,
+            [self._config["demand_entity"], *self._config.get("active_sensors", [])],
+            self._async_demand_changed,
+        )
+        await super().async_start()
+
+    async def _async_demand_changed(self, *_):
+        self._notify()
+        await self.async_refresh()
 
     def _state(self, key: str):
         return self._hass.states.get(self._config[key])
@@ -57,6 +90,7 @@ class HotWaterManager(PriceChargingManager):
             "temperature": self._number("temperature_sensor"),
             "soc": self._number("soc_sensor"),
             "request_owned": self._owned,
+            "space_heating_blocked": self.blocks_space_heating,
             "charge_start": None if self.window is None else self.window.start.isoformat(),
             "charge_end": None if self.window is None else self.window.end.isoformat(),
             "average_price": None if self.window is None else self.window.price,
@@ -93,6 +127,9 @@ class HotWaterManager(PriceChargingManager):
         await self.async_refresh()
 
     async def async_stop(self) -> None:
+        if self._remove_state_listener is not None:
+            self._remove_state_listener()
+            self._remove_state_listener = None
         await self._release()
         await super().async_stop()
         self._reason = "off"

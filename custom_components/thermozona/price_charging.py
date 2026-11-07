@@ -103,6 +103,7 @@ def choose_charge_window(
     charge_hours: float = DEFAULT_PRICE_CHARGE_HOURS,
     coast_hours: float = DEFAULT_PRICE_COAST_HOURS,
     min_spread: float = DEFAULT_PRICE_MIN_SPREAD,
+    excluded_windows: list[tuple[datetime, datetime]] | None = None,
 ) -> ChargeWindow | None:
     """Choose the cheapest contiguous block ahead of a meaningfully costlier period."""
     horizon = now + timedelta(hours=24)
@@ -110,6 +111,9 @@ def choose_charge_window(
     best = None
     for start in candidates:
         end = start + timedelta(hours=charge_hours)
+        if any(start < blocked_end and end > blocked_start
+               for blocked_start, blocked_end in (excluded_windows or [])):
+            continue
         price = average_price(slots, start, end)
         following = average_price(slots, end, end + timedelta(hours=coast_hours))
         if price is None or following is None or following - price <= min_spread:
@@ -138,6 +142,7 @@ class PriceChargingManager:
         self._unsubscribe: Callable[[], None] | None = None
         self._lock = asyncio.Lock()
         self._stopped = False
+        self.excluded_windows = lambda: []
 
     def subscribe(self, listener: Callable[[], None]) -> Callable[[], None]:
         """Subscribe an entity to updates until its removal."""
@@ -285,6 +290,12 @@ class PriceChargingManager:
                     and self.window.start <= now
                     < self.window.end + timedelta(hours=self.coast_hours)
                 )
+                exclusions = self.excluded_windows()
+                if self.window is not None and any(
+                    self.window.start < end and self.window.end > start
+                    for start, end in exclusions
+                ):
+                    retain = False
                 if not retain:
                     self.window = choose_charge_window(
                         self._slots, now,
@@ -292,6 +303,7 @@ class PriceChargingManager:
                             CONF_PRICE_CHARGE_HOURS, DEFAULT_PRICE_CHARGE_HOURS
                         )),
                         coast_hours=self.coast_hours,
+                        excluded_windows=exclusions,
                         min_spread=float(self._config.get(
                             CONF_PRICE_MIN_SPREAD, DEFAULT_PRICE_MIN_SPREAD
                         )),

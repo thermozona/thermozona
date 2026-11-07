@@ -617,6 +617,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
 
     def _resolve_effective_mode(self, pump_mode: str) -> HVACMode:
         """Map pump mode to a climate mode."""
+        if self._controller.space_heating_suspended:
+            return HVACMode.OFF
         if pump_mode == "cool":
             return HVACMode.COOL
         if pump_mode == "heat":

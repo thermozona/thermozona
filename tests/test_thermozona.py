@@ -1914,3 +1914,33 @@ async def test_price_and_hot_water_select_listener_lifecycle(fake_hass):
         assert entity._attr_current_option==manager.mode
         await entity.async_will_remove_from_hass()
         assert not manager._listeners
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('demand,active,blocked',[('on','off',True),('off','on',True),('off','unknown',True),('off','off',False)])
+async def test_boiler_priority_blocks_cv_until_actual_boiler_is_idle(fake_hass,demand,active,blocked):
+    from custom_components.thermozona.hot_water import HotWaterManager
+    controller=HeatPumpController(fake_hass,_config(heat_pump_mode='sensor.mode'))
+    controller.hot_water=HotWaterManager(fake_hass,{'demand_entity':'input_boolean.dhw','active_sensors':['binary_sensor.dhw']})
+    fake_hass.states.set('input_boolean.dhw',demand)
+    fake_hass.states.set('binary_sensor.dhw',active)
+    fake_hass.states.set('sensor.mode','heat')
+    thermostat=_create_thermostat(fake_hass,controller)
+    assert controller.space_heating_suspended is blocked
+    assert thermostat._resolve_effective_mode('heat')==(HVACMode.OFF if blocked else HVACMode.HEAT)
+    assert thermostat._resolve_effective_mode('cool')==(HVACMode.OFF if blocked else HVACMode.COOL)
+    if blocked:
+        fake_hass.states.set('switch.zone_1','on')
+        await controller.async_update_heat_pump_state()
+        assert controller._pump_state=='idle'
+        assert controller._last_flow_factors['command_active'] is False
+    assert thermostat._attr_target_temperature==20
+
+
+def test_house_charge_window_excludes_reserved_boiler_time():
+    now=datetime(2026,11,7,tzinfo=timezone.utc)
+    slots=parse_prices(_price_response(now,[.4,.4,.1,.1,.1,.2,.2,.2]+[.5]*20))
+    blocked=(now+timedelta(hours=3),now+timedelta(hours=4))
+    window=choose_charge_window(slots,now,excluded_windows=[blocked])
+    assert window is not None
+    assert window.end<=blocked[0] or window.start>=blocked[1]

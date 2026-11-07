@@ -482,6 +482,8 @@ thermozona:
     mode: monitor
     temperature_sensor: sensor.hot_water_temperature
     soc_sensor: sensor.hot_water_soc
+    active_sensors:
+      - binary_sensor.heat_pump_hot_water_active
     demand_entity: input_boolean.hot_water_request
     source_entity: input_select.hot_water_source
     last_off_entity: input_datetime.hot_water_last_off
@@ -500,3 +502,5 @@ The request entity must connect to your installation's existing protected start/
 `select.thermozona_hot_water` offers `off`, `monitor`, and `auto`. Monitor fetches prices and displays the plan without requesting heat. Auto selects the cheapest complete one-hour block starting within the next 24 hours and requests a boost when SOC is below 40%, provided the four-hour cooldown has elapsed. Stable grid export above 2,500 W for five minutes can also request a solar boost. Solar requests end after five minutes of grid import above 500 W, or one minute of missing grid measurements. All additional requests end at 99% SOC, 65°C, invalid tank readings, or a 90-minute maximum runtime. Existing equipment protections and the Home Assistant actuation bridge remain necessary.
 
 `sensor.thermozona_hot_water` exposes temperature, SOC, request ownership, the selected window, and errors. This first implementation uses the timing and thresholds above; it does not replace native hygiene cycles or calculate stored energy from temperature.
+
+Hot-water demand takes priority over the shared compressor. Configure `active_sensors` with the heat pump’s native DHW and bus-demand signals. CV demand and temporary house-charging headroom pause while a boiler request or native cycle is active, including the minimum-runtime stop delay. Unknown configured activity signals also suspend CV demand. The house planner excludes the reserved boiler window plus 15 minutes; normal room targets remain unchanged.

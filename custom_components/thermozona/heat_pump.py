@@ -128,16 +128,30 @@ class HeatPumpController:
             notify_thermostats=lambda: self._notify_thermostats(),
         )
         self._flow_supervisor = ProFlowSupervisor()
-        self.hot_water = (HotWaterManager(self._hass, entry_config[CONF_HOT_WATER])
+        self.hot_water = (HotWaterManager(self._hass, entry_config[CONF_HOT_WATER], self._hot_water_changed)
                           if CONF_HOT_WATER in entry_config else None)
         self.price_charging = PriceChargingManager(
             hass, entry_config.get(CONF_PRICE_CHARGING, {}), self._notify_thermostats
         )
+        self.price_charging.excluded_windows = lambda: (
+            self.hot_water.reserved_windows() if self.hot_water is not None else []
+        )
+
+    @property
+    def space_heating_suspended(self) -> bool:
+        """Expose shared-compressor priority without changing the user's mode."""
+        return self.hot_water is not None and self.hot_water.blocks_space_heating
+
+    def _hot_water_changed(self) -> None:
+        self._notify_thermostats()
+        if not self._shutting_down:
+            self._hass.async_create_task(self.async_update_heat_pump_state())
+            self._hass.async_create_task(self.price_charging.async_refresh())
 
     def get_price_charging_boost(self) -> float:
         """Allow price headroom only while heating is an available operation."""
         mode = self.get_operation_mode()
-        if self._shutting_down or mode not in {"heat", "auto"}:
+        if self._shutting_down or self.space_heating_suspended or mode not in {"heat", "auto"}:
             return 0.0
         if mode == "auto":
             outside = self._read_entity_float(self._outside_temp_sensor())
@@ -1270,6 +1284,11 @@ class HeatPumpController:
             self._update_pump_status(False, None)
             self._mark_flow_command_inactive()
             return
+        if self.space_heating_suspended:
+            self._last_any_circuit_on = None
+            self._update_pump_status(False, None)
+            self._mark_flow_command_inactive()
+            return
         try:
             circuits = self.get_all_circuit_entities()
             _LOGGER.debug("%s: Checking circuits for heat pump control: %s", DOMAIN, circuits)
@@ -1486,10 +1505,13 @@ class HeatPumpController:
     def refresh_entry_config(self, entry_config: dict[str, Any]) -> None:
         """Update internal reference to the config entry (for reload scenarios)."""
         self._entry_config = entry_config
-        self.hot_water = (HotWaterManager(self._hass, entry_config[CONF_HOT_WATER])
+        self.hot_water = (HotWaterManager(self._hass, entry_config[CONF_HOT_WATER], self._hot_water_changed)
                           if CONF_HOT_WATER in entry_config else None)
         self.price_charging = PriceChargingManager(
             self._hass, entry_config.get(CONF_PRICE_CHARGING, {}), self._notify_thermostats
+        )
+        self.price_charging.excluded_windows = lambda: (
+            self.hot_water.reserved_windows() if self.hot_water is not None else []
         )
         self._flow_supervisor.reset()
         self._last_flow_write_temp = None
