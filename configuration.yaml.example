@@ -63,6 +63,14 @@ thermozona:
   # auto_cool_lockout_below_c: 20.0
   # auto_min_changeover_minutes: 30
 
+  # Optional Tibber-based house charging: inspect the plan before choosing auto.
+  # price_charging:
+  #   mode: preview
+  #   boost_c: 0.5
+  #   charge_hours: 3
+  #   coast_hours: 6
+  #   min_price_spread: 0.03
+
   # Optional flow calculation tuning.
   # Keep it small here; see README for the full tuning matrix.
   flow:
@@ -91,6 +99,7 @@ thermozona:
       # floor_material: wood
       # cooling_dewpoint_margin: 2.0
       # cooling_dewpoint_protection: true
+      # price_charging: true
       # For an air-coil zone, use zone_type: air_coil and set its water sensors:
       # air_coil_requested_water_sensor: sensor.thermozona_flow_temperature
       # air_coil_measured_water_sensor: sensor.heat_pump_supply_temperature

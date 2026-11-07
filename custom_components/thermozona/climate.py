@@ -10,6 +10,7 @@ from . import (
     CONF_AIR_COIL_REQUESTED_WATER_SENSOR,
     CONF_CONTROL_MODE,
     CONF_HYSTERESIS,
+    CONF_PRICE_CHARGING,
     CONF_PWM_ACTUATOR_DELAY,
     CONF_PWM_CYCLE_TIME,
     CONF_PWM_KI,
@@ -88,6 +89,7 @@ async def async_setup_entry(
                 air_coil_measured_water_sensor=config.get(
                     CONF_AIR_COIL_MEASURED_WATER_SENSOR
                 ),
+                price_charging=config.get(CONF_PRICE_CHARGING, False),
             )
         )
 

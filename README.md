@@ -97,6 +97,8 @@ After startup you should see:
 - `number.thermozona_flow_temperature`
 - `sensor.thermozona_flow_temperature`
 - `number.thermozona_flow_curve_offset`
+- `select.thermozona_price_charging`
+- `sensor.thermozona_price_charging`
 
 Set a zone target temperature from the climate entity. Thermozona will turn the configured circuit entities on or off based on demand.
 
@@ -321,6 +323,52 @@ Selecting `air_coil_only` closes all floor/wall cooling zones, including zones w
 ### Per-Zone Heating Minimums
 
 A wall zone can set `heating_min_flow_c: 32.0`, for example. Its minimum contributes only while its circuit is active and its room remains below target. After the initial command, the shared command ramps up by at most 1.5°C and down by at most 2°C per five minutes, alongside the normal heating curve slew limits.
+
+### Charge the House During Cheaper Electricity Periods
+
+Price charging temporarily raises the effective heating target of selected floor zones. Your normal climate target remains the comfort target, including after a restart. When charging ends, zones return to that target and use the accumulated warmth. The planner never lowers the comfort target or prevents normal heating during expensive periods.
+
+This optional feature uses the installed Home Assistant Tibber integration and its `tibber.get_prices` action. No additional account token is stored in Thermozona. Price charging is off by default and each participating floor zone must opt in:
+
+```yaml
+thermozona:
+  price_charging:
+    mode: preview
+    boost_c: 0.5
+    charge_hours: 3
+    coast_hours: 6
+    min_price_spread: 0.03
+    # home: My home  # Required only when Tibber returns multiple homes.
+  zones:
+    living_room:
+      temp_sensor: sensor.living_room_temperature
+      circuits:
+        - switch.manifold_living
+      price_charging: true
+```
+
+Merge this into your existing configuration. `select.thermozona_price_charging` offers:
+
+- `off`: normal operation, with no price-related target adjustment.
+- `preview`: fetch prices and display a plan while keeping normal targets.
+- `auto`: apply temporary headroom during the selected charging block.
+
+The selection is restored across restarts. Start with preview to inspect the plan, then choose auto to use it. The planner selects the cheapest complete, contiguous block starting within the next 24 hours whose average price is sufficiently below the following coast period. It retains an active block through charging and coasting. It uses timezone-aware hourly or quarter-hour intervals, checks coverage, and requests fresh prices hourly. Missing or invalid prices remove the boost and leave normal comfort control running.
+
+| Option under `price_charging` | Default | Description |
+| --- | --- | --- |
+| `mode` | `off` | Initial mode: `off`, `preview`, or `auto`. The UI selection is restored when available. |
+| `home` | only returned home | Tibber home name; required when the response contains multiple homes. |
+| `boost_c` | `0.5` | Extra effective room target in °C, range `0` to `2`, capped by the climate entity maximum. |
+| `charge_hours` | `3` | Contiguous charging window length, range `0.5` to `6` hours. |
+| `coast_hours` | `6` | Following period used for price comparison and the coasting phase, range `1` to `12` hours. |
+| `min_price_spread` | `0.03` | Required average price difference per kWh in the Tibber account currency. |
+
+Only opted-in `floor` zones receive the boost. Manual off, cooling mode, sensor protections, and automatic heating lockouts take precedence. PWM demand is recalculated when headroom changes, and a zone closes at its effective charging target rather than extending its normal hysteresis above that target. Physical room temperature can still overshoot because floors retain heat.
+
+`sensor.thermozona_price_charging` exposes the selected phase, `charge_start`, `charge_end`, average charging/following prices, price freshness, and errors. In preview, `planned_state` shows what auto would do. Each climate entity exposes `price_charging_enabled`, `price_charging_boost_c`, and `effective_target_temperature` alongside its unchanged normal target.
+
+This first version compares electricity prices. It does not estimate stored kWh, guaranteed bill savings, future COP, heat losses, or solar gains. Existing weather compensation and flow limits remain active; use actual temperature and energy history to tune headroom and window length.
 
 ### Air-Coil Heating Interlock
 

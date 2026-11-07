@@ -13,6 +13,11 @@ from homeassistant.const import ATTR_TEMPERATURE
 
 from custom_components import thermozona
 from custom_components.thermozona import heat_pump as heat_pump_module
+from custom_components.thermozona import price_charging as price_module
+from custom_components.thermozona.price_charging import (
+    ChargeWindow, PriceChargingManager, PriceSlot, average_price,
+    choose_charge_window, parse_prices,
+)
 from custom_components.thermozona.helpers import (
     air_coil_heating_suppressed,
     resolve_circuits,
@@ -92,7 +97,7 @@ def _config(**overrides):
     return base
 
 
-def _create_thermostat(fake_hass, controller, **zone_options):
+def _create_thermostat(fake_hass, controller, control_mode=None, **zone_options):
     return ThermozonaThermostat(
         fake_hass,
         "entry-1",
@@ -101,7 +106,7 @@ def _create_thermostat(fake_hass, controller, **zone_options):
         "sensor.living",
         controller,
         hysteresis=0.2,
-        control_mode=None,
+        control_mode=control_mode,
         pwm_cycle_time=None,
         pwm_min_on_time=None,
         pwm_min_off_time=None,
@@ -1628,3 +1633,234 @@ def test_pwm_actuator_delay_default_value(fake_hass):
     thermostat = _create_pwm_thermostat(fake_hass, controller)
 
     assert thermostat._pwm_actuator_delay_minutes == 3
+
+
+# Price-aware house charging.
+
+def _price_response(start, hourly_prices, quarters=False):
+    rows = []
+    for index, price in enumerate(hourly_prices):
+        for quarter in range(4 if quarters else 1):
+            rows.append({
+                "start_time": (start + timedelta(hours=index, minutes=quarter * 15)).isoformat(),
+                "price": price,
+            })
+    return {"prices": {"home": rows}}
+
+
+@pytest.mark.parametrize("quarters", [False, True])
+def test_price_plan_selects_contiguous_cheap_block_before_peak(quarters):
+    now = datetime(2026, 11, 7, tzinfo=timezone.utc)
+    slots = parse_prices(_price_response(now, [0.4, 0.4, 0.1, 0.1, 0.1] + [0.4] * 30, quarters))
+    window = choose_charge_window(slots, now)
+    assert window.start == now + timedelta(hours=2)
+    assert window.end == now + timedelta(hours=5)
+    assert window.price == pytest.approx(0.1)
+    assert window.following_price == pytest.approx(0.4)
+
+
+def test_price_plan_requires_spread_and_complete_future_prices():
+    now = datetime(2026, 11, 7, tzinfo=timezone.utc)
+    flat = parse_prices(_price_response(now, [0.3] * 24))
+    assert choose_charge_window(flat, now) is None
+    incomplete = parse_prices(_price_response(now, [0.1, 0.1, 0.1, 0.4]))
+    assert choose_charge_window(incomplete, now) is None
+
+
+def test_price_plan_accepts_negative_prices_and_duration_weights():
+    now = datetime(2026, 11, 7, tzinfo=timezone.utc)
+    slots = parse_prices(_price_response(now, [-0.1] * 3 + [0.3] * 12))
+    assert choose_charge_window(slots, now).price == pytest.approx(-0.1)
+    weighted = [PriceSlot(now, now + timedelta(minutes=15), 0.1),
+                PriceSlot(now + timedelta(minutes=15), now + timedelta(hours=1), 0.3)]
+    assert average_price(weighted, now, now + timedelta(hours=1)) == pytest.approx(0.25)
+    assert average_price(weighted, now, now + timedelta(hours=2)) is None
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "missing", "duplicate", "naive", "multiple_homes"])
+def test_price_parser_rejects_unsafe_or_ambiguous_data(bad):
+    now = datetime(2026, 11, 7, tzinfo=timezone.utc)
+    data = _price_response(now, [0.1] * 12, quarters=True)
+    rows = data["prices"]["home"]
+    if bad in {"nan", "inf"}:
+        rows[0]["price"] = bad
+    elif bad == "missing":
+        rows.pop(3)
+    elif bad == "duplicate":
+        rows.append(rows[0])
+    elif bad == "naive":
+        rows[0]["start_time"] = "2026-11-07T00:00:00"
+    else:
+        data["prices"]["other"] = rows
+    with pytest.raises(ValueError):
+        parse_prices(data)
+
+
+def test_price_parser_handles_clock_change_using_utc_intervals():
+    data = {"prices": {"home": [
+        {"start_time": "2026-10-25T02:00:00+02:00", "price": 0.1},
+        {"start_time": "2026-10-25T02:00:00+01:00", "price": 0.2},
+        {"start_time": "2026-10-25T03:00:00+01:00", "price": 0.3},
+    ]}}
+    slots = parse_prices(data)
+    assert all(slot.end - slot.start == timedelta(hours=1) for slot in slots)
+    assert slots[0].end == slots[1].start
+
+
+@pytest.mark.asyncio
+async def test_price_manager_preview_auto_expiry_and_failed_fetch(fake_hass, monkeypatch):
+    clock = SimpleNamespace(now=datetime(2026, 11, 7, tzinfo=timezone.utc))
+    monkeypatch.setattr(price_module, "datetime", SimpleNamespace(
+        now=lambda _tz: clock.now, fromisoformat=datetime.fromisoformat
+    ))
+    response = _price_response(clock.now, [0.1] * 3 + [0.4] * 30, quarters=True)
+    fake_hass.services.async_call = AsyncMock(return_value=response)
+    manager = PriceChargingManager(fake_hass, {"mode": "preview"}, Mock())
+    await manager.async_start()
+    assert manager.state == "preview"
+    assert manager.attributes["planned_state"] == "charging"
+    assert manager.boost == 0
+    await manager.async_set_mode("auto")
+    assert manager.boost == 0.5
+    original = manager.window
+    clock.now += timedelta(minutes=30)
+    await manager.async_refresh()
+    assert manager.window == original
+    clock.now += timedelta(hours=3)
+    assert manager.boost == 0
+    assert manager.state == "coasting"
+    fake_hass.services.async_call.side_effect = RuntimeError("provider offline")
+    await manager.async_refresh()
+    assert manager.state == "unavailable"
+    assert manager.boost == 0
+    await manager.async_stop()
+    assert manager.state == "off"
+
+
+@pytest.mark.asyncio
+async def test_price_manager_does_not_apply_response_after_disabled(fake_hass):
+    now = datetime.now(timezone.utc)
+    started, resume = asyncio.Event(), asyncio.Event()
+    async def fetch(*args, **kwargs):
+        started.set()
+        await resume.wait()
+        return _price_response(now, [0.1] * 3 + [0.4] * 12)
+    fake_hass.services.async_call = fetch
+    manager = PriceChargingManager(fake_hass, {"mode": "auto"}, Mock())
+    task = asyncio.create_task(manager.async_refresh())
+    await started.wait()
+    stop = asyncio.create_task(manager.async_set_mode("off"))
+    await asyncio.sleep(0)
+    resume.set()
+    await asyncio.gather(task, stop)
+    assert manager.boost == 0
+    assert manager.window is None
+
+
+@pytest.mark.parametrize("mode,zone_type,opt_in,expected", [
+    ("heat", "floor", True, 0.5),
+    ("heat", "floor", False, 0),
+    ("heat", "air_coil", True, 0),
+    ("cool", "floor", True, 0),
+    ("off", "floor", True, 0),
+])
+def test_price_headroom_only_applies_to_opted_in_heating_floors(fake_hass, mode, zone_type, opt_in, expected):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", mode)
+    now = datetime.now(timezone.utc)
+    manager = controller.price_charging
+    manager.mode = "auto"
+    manager._slots = [PriceSlot(now - timedelta(hours=1), now + timedelta(hours=4), 0.1)]
+    manager.window = ChargeWindow(now - timedelta(minutes=1), now + timedelta(hours=3), 0.1, 0.4)
+    thermostat = _create_thermostat(fake_hass, controller, price_charging=opt_in, zone_type=zone_type)
+    assert thermostat.price_charging_boost == expected
+    assert thermostat._attr_target_temperature == 20
+    assert thermostat.effective_target_temperature == 20 + expected
+
+
+@pytest.mark.asyncio
+async def test_price_charging_opens_floor_then_coasts_without_changing_comfort(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("sensor.living", "20.1")
+    fake_hass.states.set("switch.zone_1", "off")
+    thermostat = _create_thermostat(fake_hass, controller, price_charging=True)
+    now = datetime.now(timezone.utc)
+    manager = controller.price_charging
+    manager.mode = "auto"
+    manager._slots = [PriceSlot(now - timedelta(hours=1), now + timedelta(hours=4), 0.1)]
+    manager.window = ChargeWindow(now - timedelta(minutes=1), now + timedelta(hours=3), 0.1, 0.4)
+    await thermostat._control_heating()
+    assert fake_hass.states.get("switch.zone_1").state == "on"
+    assert thermostat._attr_target_temperature == 20
+    assert controller._zone_status["living_room"]["target"] == 20.5
+    fake_hass.states.set("sensor.living", "20.5")
+    await thermostat._control_heating()
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    manager.mode = "off"
+    await thermostat._control_heating()
+    assert thermostat.effective_target_temperature == 20
+    assert thermostat._attr_target_temperature == 20
+    await thermostat.async_turn_off()
+    manager.mode = "auto"
+    assert thermostat.price_charging_boost == 0
+    await controller.async_shutdown()
+
+
+@pytest.mark.parametrize("field,value", [("boost_c", "nan"), ("charge_hours", 0), ("mode", "force")])
+def test_price_schema_rejects_invalid_configuration(field, value):
+    with pytest.raises(vol.Invalid):
+        thermozona.CONFIG_SCHEMA({"thermozona": _config(price_charging={field: value})})
+
+
+@pytest.mark.asyncio
+async def test_price_pwm_recalculates_demand_when_charge_ends(fake_hass, monkeypatch):
+    from custom_components.thermozona import thermostat as thermostat_module
+    now = datetime(2026, 11, 7, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(thermostat_module, "datetime", SimpleNamespace(now=lambda _tz: now))
+    monkeypatch.setattr(price_module, "datetime", SimpleNamespace(now=lambda _tz: now))
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("sensor.living", "20.1")
+    fake_hass.states.set("switch.zone_1", "off")
+    thermostat = _create_thermostat(fake_hass, controller, control_mode="pwm", price_charging=True)
+    manager = controller.price_charging
+    manager.mode = "auto"
+    manager._slots = [PriceSlot(now - timedelta(hours=1), now + timedelta(hours=4), 0.1)]
+    manager.window = ChargeWindow(now - timedelta(minutes=1), now + timedelta(hours=3), 0.1, 0.4)
+    await thermostat._control_heating()
+    assert thermostat._pwm_duty_cycle > 0
+    assert controller._zone_status["living_room"]["target"] == 20.5
+    manager.mode = "off"
+    await thermostat._control_heating()
+    assert thermostat._pwm_duty_cycle == 0
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    assert thermostat._attr_target_temperature == 20
+    await controller.async_shutdown()
+
+
+@pytest.mark.parametrize("outside", ["19", "unavailable"])
+def test_price_charging_respects_automatic_heating_lockout(fake_hass, outside):
+    controller = HeatPumpController(fake_hass, _config())
+    now = datetime.now(timezone.utc)
+    manager = controller.price_charging
+    manager.mode = "auto"
+    manager._slots = [PriceSlot(now - timedelta(hours=1), now + timedelta(hours=4), 0.1)]
+    manager.window = ChargeWindow(now - timedelta(minutes=1), now + timedelta(hours=3), 0.1, 0.4)
+    fake_hass.states.set("sensor.outside", outside)
+    thermostat = _create_thermostat(fake_hass, controller, price_charging=True)
+    assert thermostat.price_charging_boost == 0
+
+
+@pytest.mark.asyncio
+async def test_default_price_charging_does_not_fetch_and_removes_timer(fake_hass, monkeypatch):
+    remove = Mock()
+    monkeypatch.setattr(price_module, "async_track_time_interval", Mock(return_value=remove))
+    fake_hass.services.async_call = AsyncMock()
+    manager = PriceChargingManager(fake_hass, {}, Mock())
+    await manager.async_start()
+    fake_hass.services.async_call.assert_not_called()
+    await manager.async_stop()
+    remove.assert_called_once()

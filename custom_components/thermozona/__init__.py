@@ -1,4 +1,6 @@
 """Thermozona integration entrypoint."""
+import math
+
 from homeassistant.config import async_hass_config_yaml
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.config_entries import ConfigEntry, SOURCE_IMPORT
@@ -67,6 +69,17 @@ CONF_ZONE_FLOW_WEIGHT = "zone_flow_weight"
 CONF_ZONE_HEATING_MIN_FLOW = "heating_min_flow_c"
 CONF_ZONE_SOLAR_WEIGHT = "zone_solar_weight"
 CONF_ZONE_TYPE = "zone_type"
+CONF_PRICE_CHARGING = "price_charging"
+CONF_PRICE_MODE = "mode"
+CONF_PRICE_HOME = "home"
+CONF_PRICE_BOOST = "boost_c"
+CONF_PRICE_CHARGE_HOURS = "charge_hours"
+CONF_PRICE_COAST_HOURS = "coast_hours"
+CONF_PRICE_MIN_SPREAD = "min_price_spread"
+DEFAULT_PRICE_BOOST = 0.5
+DEFAULT_PRICE_CHARGE_HOURS = 3.0
+DEFAULT_PRICE_COAST_HOURS = 6.0
+DEFAULT_PRICE_MIN_SPREAD = 0.03
 CONF_AIR_COIL_REQUESTED_WATER_SENSOR = "air_coil_requested_water_sensor"
 CONF_AIR_COIL_MEASURED_WATER_SENSOR = "air_coil_measured_water_sensor"
 CONF_FLOOR_MATERIAL = "floor_material"
@@ -254,6 +267,7 @@ ZONE_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_CIRCUITS): [cv.entity_id],
         vol.Required(CONF_TEMP_SENSOR): cv.entity_id,
+        vol.Optional(CONF_PRICE_CHARGING, default=False): cv.boolean,
         vol.Optional(CONF_HYSTERESIS): vol.All(
             vol.Coerce(float),
             vol.Range(min=0, max=5),
@@ -325,6 +339,31 @@ ZONE_SCHEMA = vol.Schema(
     }
 )
 
+def _finite_float(value: object) -> float:
+    """Reject nonfinite numeric configuration before it reaches control logic."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise vol.Invalid("Value must be finite")
+    return number
+
+
+PRICE_CHARGING_SCHEMA = vol.Schema({
+    vol.Optional(CONF_PRICE_MODE, default="off"): vol.In(["off", "preview", "auto"]),
+    vol.Optional(CONF_PRICE_HOME): cv.string,
+    vol.Optional(CONF_PRICE_BOOST, default=DEFAULT_PRICE_BOOST): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=0, max=2)
+    ),
+    vol.Optional(CONF_PRICE_CHARGE_HOURS, default=DEFAULT_PRICE_CHARGE_HOURS): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=0.5, max=6)
+    ),
+    vol.Optional(CONF_PRICE_COAST_HOURS, default=DEFAULT_PRICE_COAST_HOURS): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=1, max=12)
+    ),
+    vol.Optional(CONF_PRICE_MIN_SPREAD, default=DEFAULT_PRICE_MIN_SPREAD): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=0, max=10)
+    ),
+})
+
 CONFIG_SCHEMA = vol.Schema({
     DOMAIN: vol.Schema({
         vol.Required(CONF_OUTSIDE_TEMP_SENSOR): cv.entity_id,
@@ -366,6 +405,7 @@ CONFIG_SCHEMA = vol.Schema({
             CONF_FLOW,
             default={},
         ): FLOW_SCHEMA,
+        vol.Optional(CONF_PRICE_CHARGING, default={}): PRICE_CHARGING_SCHEMA,
         vol.Required(CONF_ZONES): {
             cv.string: ZONE_SCHEMA
         }
@@ -459,6 +499,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     controller.begin_platform_setup()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    await controller.price_charging.async_start()
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

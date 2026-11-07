@@ -99,6 +99,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         heating_min_flow_c: float | None = None,
         air_coil_requested_water_sensor: str | None = None,
         air_coil_measured_water_sensor: str | None = None,
+        price_charging: bool = False,
     ) -> None:
         """Initialize the thermostat."""
         self.hass = hass
@@ -159,6 +160,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         )
         self._zone_solar_weight = max(0.0, self._zone_solar_weight)
         self._zone_type = (zone_type or "floor").lower()
+        self._price_charging_enabled = price_charging
+        self._last_price_boost = 0.0
         self._air_coil_requested_water_sensor = (
             air_coil_requested_water_sensor or DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR
         )
@@ -318,6 +321,9 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             ),
             "zone_solar_weight": round(self._zone_solar_weight, 2),
             "zone_type": self._zone_type,
+            "price_charging_enabled": self._price_charging_enabled,
+            "price_charging_boost_c": self.price_charging_boost,
+            "effective_target_temperature": self.effective_target_temperature,
             "floor_material": self._floor_material,
             "cooling_dewpoint_margin": self._cooling_dewpoint_margin,
             "cooling_dewpoint_protection": self._cooling_dewpoint_protection,
@@ -336,6 +342,23 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             self._reset_pwm_state(reset_integral=True)
 
         await self._control_heating()
+
+    @property
+    def price_charging_boost(self) -> float:
+        """Return additional headroom for an opted-in, enabled floor zone."""
+        if (
+            not self._price_charging_enabled
+            or self._zone_type != "floor"
+            or self._manual_mode == HVACMode.OFF
+        ):
+            return 0.0
+        boost = self._controller.get_price_charging_boost()
+        return max(0.0, min(boost, self._attr_max_temp - self._attr_target_temperature))
+
+    @property
+    def effective_target_temperature(self) -> float:
+        """Apply temporary headroom without changing the saved comfort target."""
+        return self._attr_target_temperature + self.price_charging_boost
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set HVAC mode."""
@@ -366,6 +389,10 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
 
     async def _control_heating(self) -> None:
         """Control the heating based on configured strategy."""
+        previous_boost = self._last_price_boost
+        self._last_price_boost = self.price_charging_boost
+        if self._last_price_boost != previous_boost:
+            self._reset_pwm_state(reset_integral=True)
         if self._manual_mode == HVACMode.OFF:
             self._air_coil_heat_suppressed = False
             self._controller.update_zone_status(
@@ -389,7 +416,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             else:
                 self._controller.update_zone_status(
                     self._zone_name,
-                    target=self._attr_target_temperature,
+                    target=self.effective_target_temperature,
                     current=self._attr_target_temperature,
                     active=True,
                     duty_cycle=0.0,
@@ -411,7 +438,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         active_before = self._circuits_are_active()
         self._controller.update_zone_status(
             self._zone_name,
-            target=self._attr_target_temperature,
+            target=self.effective_target_temperature,
             current=current_temp,
             active=active_before,
             duty_cycle=self._current_zone_duty_hint(active_before),
@@ -437,7 +464,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             self._reset_pwm_state(reset_integral=True)
             self._controller.update_zone_status(
                 self._zone_name,
-                target=self._attr_target_temperature,
+                target=self.effective_target_temperature,
                 current=current_temp,
                 active=False,
                 duty_cycle=0.0,
@@ -462,7 +489,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             self._reset_pwm_state(reset_integral=True)
             self._controller.update_zone_status(
                 self._zone_name,
-                target=self._attr_target_temperature,
+                target=self.effective_target_temperature,
                 current=current_temp,
                 active=False,
                 duty_cycle=0.0,
@@ -485,7 +512,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             and self._zone_type != "air_coil"
             and self._controller.should_suppress_floor_cooling(
                 zone_type=self._zone_type,
-                target=self._attr_target_temperature,
+                target=self.effective_target_temperature,
                 current=current_temp,
                 floor_material=self._floor_material,
                 cooling_dewpoint_margin=self._cooling_dewpoint_margin,
@@ -498,7 +525,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             self._reset_pwm_state(reset_integral=False)
             self._controller.update_zone_status(
                 self._zone_name,
-                target=self._attr_target_temperature,
+                target=self.effective_target_temperature,
                 current=current_temp,
                 active=not circuits_closed,
                 duty_cycle=0.0 if circuits_closed else 100.0,
@@ -536,7 +563,15 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         else:
             self._air_coil_heat_suppressed = False
 
-        if self._air_coil_heat_suppressed:
+        charge_cap_reached = (
+            self._last_price_boost > 0
+            and current_temp >= self.effective_target_temperature
+        ) or (
+            previous_boost > 0
+            and self._last_price_boost == 0
+            and current_temp >= self._attr_target_temperature
+        )
+        if self._air_coil_heat_suppressed or charge_cap_reached:
             await self._set_circuits_state(False)
             self._attr_hvac_action = HVACAction.IDLE
         elif self._control_mode == CONTROL_MODE_PWM:
@@ -548,7 +583,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         active_after = self._circuits_are_active()
         self._controller.update_zone_status(
             self._zone_name,
-            target=self._attr_target_temperature,
+            target=self.effective_target_temperature,
             current=current_temp,
             active=active_after,
             duty_cycle=self._current_zone_duty_hint(active_after),
@@ -595,7 +630,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
     ) -> None:
         """Original hysteresis based control."""
         hysteresis = self._hysteresis
-        target = self._attr_target_temperature
+        target = self.effective_target_temperature
 
         if effective_mode == HVACMode.HEAT:
             should_activate = current_temp < (target - hysteresis)
@@ -696,7 +731,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         """Calculate PI duty cycle percentage."""
         self._pwm_duty_cycle, self._pwm_integral, self._last_control_time = (
             calculate_pwm_duty(
-                target_temperature=self._attr_target_temperature,
+                target_temperature=self.effective_target_temperature,
                 current_temp=current_temp,
                 effective_mode=effective_mode,
                 now=now,

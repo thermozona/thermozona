@@ -32,6 +32,7 @@ from . import (
     CONF_PRO_PREHEAT_FORECAST_SENSOR,
     CONF_PRO_PREHEAT_SOLAR_SENSOR,
     CONF_OUTSIDE_TEMP_SENSOR,
+    CONF_PRICE_CHARGING,
     CONF_WEATHER_SLOPE_COOL,
     CONF_WEATHER_SLOPE_HEAT,
     CONF_WRITE_DEADBAND_C,
@@ -56,6 +57,7 @@ from . import (
     ZONE_TYPE_AIR_COIL,
 )
 from .helpers import resolve_circuits
+from .price_charging import PriceChargingManager
 from .pro.flow_curve import FlowCurveRuntimeManager
 from .pro.flow_supervisor import ProFlowSupervisor
 
@@ -124,6 +126,23 @@ class HeatPumpController:
             notify_thermostats=lambda: self._notify_thermostats(),
         )
         self._flow_supervisor = ProFlowSupervisor()
+        self.price_charging = PriceChargingManager(
+            hass, entry_config.get(CONF_PRICE_CHARGING, {}), self._notify_thermostats
+        )
+
+    def get_price_charging_boost(self) -> float:
+        """Allow price headroom only while heating is an available operation."""
+        mode = self.get_operation_mode()
+        if self._shutting_down or mode not in {"heat", "auto"}:
+            return 0.0
+        if mode == "auto":
+            outside = self._read_entity_float(self._outside_temp_sensor())
+            maximum = self._entry_config.get(
+                CONF_AUTO_HEAT_LOCKOUT_ABOVE_C, DEFAULT_AUTO_HEAT_LOCKOUT_ABOVE_C
+            )
+            if outside is None or outside > maximum:
+                return 0.0
+        return self.price_charging.boost
 
     def begin_platform_setup(self) -> None:
         """Hold control idle until mode and flow output platforms are ready."""
@@ -1426,6 +1445,7 @@ class HeatPumpController:
     async def async_shutdown(self) -> None:
         """Close all circuits and clear demand before unload or reload."""
         self._shutting_down = True
+        await self.price_charging.async_stop()
         if self._demand_off_task is not None:
             self._demand_off_task.cancel()
             self._demand_off_task = None
@@ -1460,6 +1480,9 @@ class HeatPumpController:
     def refresh_entry_config(self, entry_config: dict[str, Any]) -> None:
         """Update internal reference to the config entry (for reload scenarios)."""
         self._entry_config = entry_config
+        self.price_charging = PriceChargingManager(
+            self._hass, entry_config.get(CONF_PRICE_CHARGING, {}), self._notify_thermostats
+        )
         self._flow_supervisor.reset()
         self._last_flow_write_temp = None
         self._last_flow_write_time = None

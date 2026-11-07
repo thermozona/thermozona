@@ -33,6 +33,7 @@ async def async_setup_entry(
         [
             ThermozonaHeatPumpStatusSensor(config_entry.entry_id, controller),
             ThermozonaFlowTemperatureSensor(config_entry.entry_id, controller),
+            ThermozonaPriceChargingSensor(config_entry.entry_id, controller),
         ]
     )
 
@@ -122,3 +123,45 @@ class ThermozonaFlowTemperatureSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return breakdown attributes for the computed flow temperature."""
         return self._controller.get_flow_temperature_factors()
+
+
+class ThermozonaPriceChargingSensor(SensorEntity):
+    """Expose the current charging phase and the next planned window."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Price Charging"
+    _attr_should_poll = False
+    _attr_icon = "mdi:home-battery"
+
+    def __init__(self, entry_id: str, controller: HeatPumpController) -> None:
+        self._controller = controller
+        self._attr_unique_id = f"{entry_id}_price_charging_status"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry_id)}, "name": "Thermozona"
+        }
+        self._unsubscribe = None
+
+    @property
+    def native_value(self) -> str:
+        """Return off, preview, normal, charging, coasting, or unavailable."""
+        return self._controller.price_charging.state
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the current plan and price diagnostics."""
+        return self._controller.price_charging.attributes
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to plan updates."""
+        await super().async_added_to_hass()
+        self._unsubscribe = self._controller.price_charging.subscribe(
+            self.async_write_ha_state
+        )
+        self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Remove the subscription on unload."""
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+        await super().async_will_remove_from_hass()
