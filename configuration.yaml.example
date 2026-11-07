@@ -111,6 +111,13 @@ thermozona:
       # price_charging: true
       # setback_schedule: schedule.office_away
       # setback_c: 1.0
+      # Optional learned warm-up before the schedule period ends.
+      # schedule_recovery:
+      #   enabled: true
+      #   fallback_minutes: 120
+      #   max_minutes: 180
+      #   buffer_minutes: 15
+      #   history_days: 7
       # For an air-coil zone, use zone_type: air_coil and set its water sensors:
       # air_coil_requested_water_sensor: sensor.thermozona_flow_temperature
       # air_coil_measured_water_sensor: sensor.heat_pump_supply_temperature

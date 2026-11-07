@@ -5,15 +5,19 @@ class ThermozonaControlCard extends HTMLElement {
     if (!this.shadowRoot) {
       this.attachShadow({ mode: "open" });
       this.shadowRoot.addEventListener("click", (event) => this._click(event));
+      this.shadowRoot.addEventListener("input", (event) => this._plannerInput(event));
+      this.shadowRoot.addEventListener("change", (event) => this._plannerInput(event));
     }
     this._render();
   }
 
   set hass(hass) {
     this._hass = hass;
+    // Keep an open editor stable while live temperatures and diagnostics update.
+    if (this._plannerOpen) return;
     const entities = Object.entries(hass.states).filter(([id]) =>
       id.includes("thermozona") || id === "sensor.elektriciteitsprijs_actief" ||
-      id === "schedule.werkkamer_buitenshuis" ||
+      id.startsWith("schedule.") ||
       id === "binary_sensor.ventilation_floor_condensation_risk"
     );
     if (entities.length !== this._previous?.size ||
@@ -86,13 +90,179 @@ class ThermozonaControlCard extends HTMLElement {
     </div>`;
   }
   _workSchedule() {
-    if (!this._state("schedule.werkkamer_buitenshuis")) return "";
-    const active = this._value("schedule.werkkamer_buitenshuis") === "on";
-    const attrs = this._attrs("climate.thermozona_begane_grond_werkkamer");
-    const target = attrs.scheduled_target_temperature ?? attrs.temperature;
+    if (!this._rooms().length) return "";
     return `<button class="work-plan" data-action="work-plan"><ha-icon icon="mdi:calendar-week"></ha-icon>
-      <span>Werkkamer · ${active ? "Buitenshuis" : "Normaal"}${target == null ? "" : ` · ${this._number(target)} °C`}
-      <small>Werkschema aanpassen</small></span><ha-icon icon="mdi:chevron-right"></ha-icon></button>`;
+      <span>Kamers plannen<small>Weekschema per ruimte aanpassen</small></span><ha-icon icon="mdi:chevron-right"></ha-icon></button>`;
+  }
+  _rooms() {
+    return Object.values(this._hass?.states || {}).filter((s) =>
+      s.entity_id?.startsWith("climate.thermozona_") && s.attributes?.setback_schedule
+    ).sort((a, b) => (a.attributes.friendly_name || a.entity_id).localeCompare(b.attributes.friendly_name || b.entity_id, "nl"));
+  }
+  _weekdays() {
+    return [["monday", "Maandag", "Ma"], ["tuesday", "Dinsdag", "Di"], ["wednesday", "Woensdag", "Wo"],
+      ["thursday", "Donderdag", "Do"], ["friday", "Vrijdag", "Vr"], ["saturday", "Zaterdag", "Za"], ["sunday", "Zondag", "Zo"]];
+  }
+  _week(schedule) {
+    return Object.fromEntries(this._weekdays().map(([day]) => [day, JSON.parse(JSON.stringify(schedule[day] || []))]));
+  }
+  _time(value, end = false) {
+    if (end && (value?.startsWith("24:") || value === "23:59:59.999999")) return "24:00:00";
+    return value?.length === 5 ? `${value}:00` : value;
+  }
+  _fingerprint(week) {
+    return JSON.stringify(this._weekdays().map(([day]) => (week[day] || []).map((block) => ({
+      from: this._time(block.from), to: this._time(block.to, true), data: block.data || {},
+    }))));
+  }
+  async _openPlanner() {
+    this._plannerOpen = true;
+    this._plannerDirty = false;
+    const rooms = this._rooms();
+    const room = rooms.find((s) => s.entity_id === this._plannerRoom) ||
+      rooms.find((s) => s.entity_id.includes("werkkamer")) || rooms[0];
+    if (!room) { this._plannerError = "Er zijn nog geen kamerschema’s gekoppeld."; this._render(); return; }
+    await this._loadPlannerRoom(room.entity_id);
+  }
+  async _loadPlannerRoom(entityId) {
+    if (this._plannerDirty) {
+      this._plannerError = "Sla eerst op of annuleer je wijzigingen voordat je een andere kamer kiest.";
+      this._render();
+      return;
+    }
+    const request = this._plannerRequest = (this._plannerRequest || 0) + 1;
+    this._plannerRoom = entityId;
+    this._plannerLoading = true;
+    this._plannerError = "";
+    this._plannerMessage = "";
+    this._plannerDraft = null;
+    this._render();
+    try {
+      const entity = this._attrs(entityId).setback_schedule;
+      const schedules = await this._hass.callWS({ type: "schedule/list" });
+      let schedule = schedules.find((s) => `schedule.${s.id}` === entity);
+      if (!schedule) {
+        const entry = await this._hass.callWS({ type: "config/entity_registry/get", entity_id: entity });
+        schedule = schedules.find((s) => s.id === entry.unique_id);
+      }
+      if (!schedule) throw new Error("missing_schedule");
+      if (!this._plannerOpen || request !== this._plannerRequest) return;
+      this._plannerScheduleId = schedule.id;
+      this._plannerDraft = this._week(schedule);
+      this._plannerOriginal = this._fingerprint(this._plannerDraft);
+    } catch (_) {
+      if (request === this._plannerRequest) this._plannerError = "Het schema kon niet worden geladen. Probeer opnieuw.";
+    } finally {
+      if (request === this._plannerRequest) { this._plannerLoading = false; this._render(); }
+    }
+  }
+  _plannerInput(event) {
+    const field = event.target;
+    if (field.dataset?.plannerRoom !== undefined && event.type === "change") {
+      this._loadPlannerRoom(field.value);
+      return;
+    }
+    if (!this._plannerDraft || !field.dataset?.day || !["from", "to"].includes(field.dataset.edge)) return;
+    const block = this._plannerDraft[field.dataset.day]?.[Number(field.dataset.index)];
+    if (!block) return;
+    block[field.dataset.edge] = field.dataset.edge === "to" && field.value === "00:00" ? "24:00:00" :
+      field.value ? `${field.value}:00` : "";
+    this._plannerDirty = true;
+    this._plannerError = "";
+    this._plannerMessage = "";
+    const save = this.shadowRoot.querySelector("#planner-save");
+    if (save) save.disabled = false;
+    const message = this.shadowRoot.querySelector(".planner-message");
+    if (message) message.textContent = "";
+  }
+  async _savePlanner() {
+    this._plannerError = "";
+    const week = this._week(this._plannerDraft);
+    for (const [day, label] of this._weekdays()) {
+      const minutes = (value, end = false) => {
+        const match = /^(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?$/.exec(value || "");
+        if (!match || Number(match[2]) > 59 || Number(match[1]) > (end ? 24 : 23)) return NaN;
+        return Number(match[1]) * 60 + Number(match[2]);
+      };
+      week[day].sort((a, b) => minutes(a.from) - minutes(b.from));
+      let previous = -1;
+      for (const block of week[day]) {
+        const from = minutes(block.from), to = minutes(this._time(block.to, true), true);
+        if (!Number.isFinite(from) || !Number.isFinite(to) || to > 1440 || from >= to) {
+          this._plannerError = `${label}: kies een begintijd vóór de eindtijd. Verdeel een nachtperiode over twee dagen.`;
+          this._render(); return;
+        }
+        if (from < previous) { this._plannerError = `${label}: de tijdblokken overlappen.`; this._render(); return; }
+        previous = to;
+      }
+    }
+    this._plannerSaving = true;
+    this._render();
+    try {
+      const schedules = await this._hass.callWS({ type: "schedule/list" });
+      const current = schedules.find((s) => s.id === this._plannerScheduleId);
+      const desired = this._fingerprint(week);
+      const existing = current && this._fingerprint(this._week(current));
+      if (existing !== this._plannerOriginal && existing !== desired) {
+        this._plannerError = "Dit schema is elders gewijzigd. Laad het opnieuw voordat je opslaat.";
+        return;
+      }
+      if (existing !== desired) await this._hass.callWS({ type: "schedule/update",
+        schedule_id: this._plannerScheduleId, name: current.name,
+        ...(current.icon ? { icon: current.icon } : {}), ...week });
+      const verified = (await this._hass.callWS({ type: "schedule/list" })).find((s) => s.id === this._plannerScheduleId);
+      if (!verified || this._fingerprint(this._week(verified)) !== desired) throw new Error("verification_failed");
+      this._plannerDraft = this._week(verified);
+      this._plannerOriginal = desired;
+      this._plannerDirty = false;
+      this._plannerMessage = "Weekschema opgeslagen.";
+    } catch (error) {
+      this._plannerError = error.code === "unauthorized" ? "Je hebt beheerrechten nodig om schema’s aan te passen." :
+        "Opslaan is niet bevestigd. Je wijzigingen staan nog in de editor; probeer opnieuw.";
+    } finally { this._plannerSaving = false; this._render(); }
+  }
+  _plannerHTML() {
+    const rooms = this._rooms(), attrs = this._attrs(this._plannerRoom);
+    const disabled = this._plannerLoading || this._plannerSaving;
+    const form = this._plannerDraft && this._weekdays().map(([day, label, short]) => {
+      const blocks = this._plannerDraft[day];
+      return `<div class="day"><span class="day-label">${short}</span><div class="day-times">
+        ${blocks.map((block, index) => `<div class="time-block">
+          <input type="time" step="60" value="${this._escape(block.from?.slice(0, 5))}" aria-label="${label} begintijd ${index + 1}"
+            data-day="${day}" data-index="${index}" data-edge="from" ${disabled ? "disabled" : ""}>
+          <span>tot</span><input type="time" step="60" value="${this._escape(this._time(block.to, true)?.startsWith("24:") ? "00:00" : block.to?.slice(0, 5))}"
+            aria-label="${label} eindtijd ${index + 1}" data-day="${day}" data-index="${index}" data-edge="to" ${disabled ? "disabled" : ""}>
+          <button class="remove" data-action="planner-remove" data-day="${day}" data-index="${index}" aria-label="${label} tijdblok ${index + 1} verwijderen" ${disabled ? "disabled" : ""}>×</button>
+        </div>`).join("")}
+        <button class="add" data-action="planner-add" data-day="${day}" ${disabled ? "disabled" : ""}>${blocks.length ? "+ Nog een blok" : "+ Tijdblok"}</button>
+      </div></div>`;
+    }).join("");
+    return `<style>
+      :host{display:block;color:var(--primary-text-color);font-family:var(--primary-font-family,Roboto,sans-serif)}
+      *{box-sizing:border-box}ha-card{display:block;padding:18px;border-radius:var(--ha-card-border-radius,16px)}
+      button,input,select{font:inherit;color:inherit}button{cursor:pointer}button:disabled{opacity:.5;cursor:wait}
+      .heading{display:flex;justify-content:space-between;align-items:center;gap:12px}h2{font-size:18px;margin:0;font-weight:600}
+      .close,.add,.remove,.reload{border:0;background:none;color:var(--primary-color,#03a9f4);padding:8px;min-height:36px}
+      .close{font-size:12px}.intro,.hint{font-size:12px;line-height:19px;color:var(--secondary-text-color)}
+      label{display:block;font-size:13px;margin-top:14px}select{display:block;width:100%;margin:6px 0 14px;padding:10px;background:var(--secondary-background-color);border:1px solid var(--divider-color);border-radius:6px;font-size:14px}
+      .day{display:flex;gap:10px;padding:9px 0;border-top:1px solid var(--divider-color)}.day-label{flex:0 0 24px;font-size:13px;padding-top:9px;font-weight:500}
+      .day-times{min-width:0;flex:1}.time-block{display:flex;gap:5px;align-items:center;margin-bottom:3px}.time-block>span{font-size:11px;color:var(--secondary-text-color)}
+      input{min-width:0;width:0;flex:1;font-size:16px;padding:6px 2px;background:var(--secondary-background-color);border:1px solid var(--divider-color);border-radius:5px;color-scheme:dark light}
+      .remove{flex:0 0 25px;padding:2px;font-size:22px;color:var(--secondary-text-color)}.add{font-size:12px;padding:2px 0;min-height:27px}
+      .actions{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:14px}.save{padding:10px 18px;border:0;background:var(--primary-color,#03a9f4);color:var(--text-primary-color,#fff);border-radius:6px;min-height:40px}
+      .planner-message{font-size:12px;line-height:18px;margin-top:10px;color:var(--primary-color,#03a9f4)}.planner-message.error{color:var(--error-color,#ef5350)}
+      button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--primary-color,#03a9f4);outline-offset:2px}
+    </style><ha-card>
+      <div class="heading"><h2>Ruimteplanning</h2><button class="close" data-action="planner-close" ${this._plannerSaving ? "disabled" : ""}>${this._plannerDirty ? "Annuleren" : "Sluiten"}</button></div>
+      <p class="intro">Kies de uren waarop een kamer ${this._number(attrs.setback_c ?? 1)} °C koeler mag zijn. Thermozona plant de normale temperatuur voor het einde van zo’n periode.</p>
+      <label>Kamer<select data-planner-room ${disabled ? "disabled" : ""}>${rooms.map((s) => `<option value="${s.entity_id}" ${s.entity_id === this._plannerRoom ? "selected" : ""}>${this._escape((s.attributes.friendly_name || s.entity_id).replace(/^Thermozona\s+/i, ""))}</option>`).join("")}</select></label>
+      ${this._value(this._plannerRoom) === "off" ? '<p class="hint">Deze kamer staat uit. Het schema zet de kamer niet aan.</p>' : ""}
+      ${attrs.recovery_enabled ? '<p class="hint">Thermozona begint zo nodig eerder met opwarmen. De voorlooptijd leert mee met deze kamer.</p>' : ""}
+      ${this._plannerLoading ? '<p class="hint">Schema laden…</p>' : form || ""}
+      <div class="planner-message ${this._plannerError ? "error" : ""}" role="status">${this._escape(this._plannerError || this._plannerMessage)}</div>
+      <div class="actions"><button class="reload" data-action="planner-reload" ${disabled ? "disabled" : ""}>${this._plannerDirty ? "Wijzigingen verwerpen" : "Opnieuw laden"}</button><button id="planner-save" class="save" data-action="planner-save" ${disabled || !this._plannerDraft || !this._plannerDirty ? "disabled" : ""}>Opslaan</button></div>
+      <p class="hint">Eindtijd 00:00 betekent het einde van die dag. Lege dagen houden de normale temperatuur.</p>
+    </ha-card>`;
   }
   _alerts() {
     const problems = [
@@ -125,6 +295,7 @@ class ThermozonaControlCard extends HTMLElement {
   }
   _render() {
     if (!this.shadowRoot || !this._hass) return;
+    if (this._plannerOpen) { this.shadowRoot.innerHTML = this._plannerHTML(); return; }
     const mode = this._value("select.thermozona_heat_pump_mode");
     const boiler = this._attrs("sensor.thermozona_hot_water").space_heating_blocked;
     const status = this._value("sensor.thermozona_heat_pump_status");
@@ -161,7 +332,7 @@ class ThermozonaControlCard extends HTMLElement {
       .alert>ha-icon{color:var(--warning-color,#ffb74d);--mdc-icon-size:21px}.alert>span{flex:1}.alert strong{font-size:13px;font-weight:500}
       .alert-detail{display:block;font-size:12px;line-height:18px;color:var(--secondary-text-color)}.alert .chevron{color:var(--secondary-text-color);--mdc-icon-size:18px}
       .quiet{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--secondary-text-color);min-height:38px}.quiet ha-icon{--mdc-icon-size:16px}
-      .footer{display:flex;justify-content:space-between;gap:8px;padding-top:4px}.link{display:flex;align-items:center;gap:6px;border:0;background:none;font-size:12px;padding:8px 0;min-height:36px;color:var(--secondary-text-color)}
+      .footer{display:flex;justify-content:space-between;gap:8px;padding-top:4px}.link{display:flex;align-items:center;gap:6px;border:0;background:none;font-size:12px;padding:8px 0;min-height:36px;color:var(--secondary-text-color);text-decoration:none}
       .link ha-icon{--mdc-icon-size:17px}.error{font-size:12px;color:var(--error-color,#ef5350);padding-top:10px}
       @media(max-width:350px){ha-card{padding:14px}.status-title{font-size:16px}.price{font-size:11px}.row-value{display:none}}
     </style><ha-card>
@@ -174,8 +345,8 @@ class ThermozonaControlCard extends HTMLElement {
       <div class="charges">${this._row("house", "Huis laden", "mdi:home-thermometer-outline")}${this._row("boiler", "Boiler laden", "mdi:water-boiler")}</div>
       ${this._workSchedule()}
       ${this._alerts()}
-      <div class="footer"><button class="link" data-action="boiler"><ha-icon icon="mdi:water-boiler"></ha-icon>Boiler bekijken</button>
-        <button class="link" data-action="settings"><ha-icon icon="mdi:tune-variant"></ha-icon>Instellingen</button></div>
+      <div class="footer"><a class="link" href="/dashboard-vloerverwarming/boiler"><ha-icon icon="mdi:water-boiler"></ha-icon>Boiler bekijken</a>
+        <a class="link" href="/dashboard-vloerverwarming/detail"><ha-icon icon="mdi:tune-variant"></ha-icon>Instellingen</a></div>
       ${this._error ? `<div class="error" role="alert">${this._escape(this._error)}</div>` : ""}
     </ha-card>`;
   }
@@ -187,10 +358,19 @@ class ThermozonaControlCard extends HTMLElement {
       this.dispatchEvent(new CustomEvent("hass-more-info", { bubbles: true, composed: true, detail: { entityId: button.dataset.entity } }));
       return;
     }
-    if (action === "boiler" || action === "settings" || action === "work-plan") {
-      const path = action === "work-plan" ? "/config/helpers" : action === "boiler" ? "/dashboard-vloerverwarming/boiler" : "/dashboard-vloerverwarming/detail";
-      history.pushState(null, "", path);
-      window.dispatchEvent(new Event("location-changed"));
+    if (action === "work-plan") { await this._openPlanner(); return; }
+    if (action === "planner-close") { this._plannerOpen = false; this._plannerRequest++; this._render(); return; }
+    if (action === "planner-save") { await this._savePlanner(); return; }
+    if (action === "planner-reload") { this._plannerDirty = false; await this._loadPlannerRoom(this._plannerRoom); return; }
+    if (action === "planner-add" || action === "planner-remove") {
+      const blocks = this._plannerDraft?.[button.dataset.day];
+      if (!blocks) return;
+      if (action === "planner-add") blocks.push({ from: "08:00:00", to: "18:00:00" });
+      else blocks.splice(Number(button.dataset.index), 1);
+      this._plannerDirty = true;
+      this._plannerError = "";
+      this._plannerMessage = "";
+      this._render();
       return;
     }
     const entity = action === "mode" ? "select.thermozona_heat_pump_mode" : button.dataset.entity;

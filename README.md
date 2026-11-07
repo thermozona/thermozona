@@ -209,6 +209,7 @@ thermozona:
 | `control_mode` | No | `bang_bang` | `bang_bang` or `pwm`. |
 | `setback_schedule` | No | none | Schedule/helper entity: while on, lower this zone's heating comfort target. Create a UI Schedule helper to edit days and times in Home Assistant. |
 | `setback_c` | No | `1.0` | Scheduled heating reduction in °C, range `0` to `5`. Extra price charging pauses for this zone during setback. |
+| `schedule_recovery` | No | disabled | Optional early return to normal comfort before the absence ends; see below. |
 | `pwm_cycle_time` | No | `15` | PWM cycle length in minutes, range `5` to `30`. |
 | `pwm_min_on_time` | No | `3` | Minimum PWM on time in minutes, range `1` to `10`. |
 | `pwm_min_off_time` | No | `3` | Minimum PWM off time in minutes, range `1` to `10`. |
@@ -426,6 +427,48 @@ thermozona:
 ```
 
 With a normal target of 20°C, an active schedule displays and controls 19°C. When the schedule ends it returns to 20°C. A manual temperature adjustment during setback adjusts the underlying comfort setting by the same amount. The comfort setting is retained over restarts. The schedule does not activate zones that are off or lower cooling targets. Missing schedule data retains normal comfort and suspends extra price charging in the affected zone.
+
+Each room can use its own UI Schedule helper. The optional
+[dashboard card](docs/dashboard/README.md) opens a room selector and weekly editor
+directly in Thermozona. Fill in the periods when reduced heating is acceptable;
+empty days retain normal comfort. Editing schedules requires an administrator.
+
+To anticipate the end of an absence, enable recovery on that zone:
+
+```yaml
+      setback_schedule: schedule.office_away
+      setback_c: 1.0
+      schedule_recovery:
+        enabled: true
+        fallback_minutes: 120
+        max_minutes: 180
+        buffer_minutes: 15
+        history_days: 7
+```
+
+Thermozona estimates the required lead time from the current temperature deficit
+and observed warming during periods with both an open room circuit and shared
+heating demand. It reads recorder history in the recorder executor and refreshes
+six-hourly. At least three usable hourly observations on two days, spanning at
+least twelve hours, are required. Sparse, invalid and cooling readings are
+excluded. Until enough observations exist, `fallback_minutes` estimates the time
+for the configured setback, scaled to the actual deficit. `buffer_minutes` adds
+an allowance. `max_minutes` caps the entire lead time, including PWM cycle
+alignment and known boiler reservations.
+
+Within that cap, complete price data can advance the start by at most thirty
+minutes when the average price improves by at least €0.03/kWh. Once recovery
+starts, normal comfort remains active until that schedule period ends; price
+charging cannot add extra room temperature during the absence. Recovery follows
+ordinary heating control, manual off, cooling mode, missing-sensor protection
+and boiler priority. The room warms according to the available heat; reaching
+the target by the scheduled end is an estimate, particularly while learning or
+when the boiler takes priority.
+
+Climate attributes expose `recovery_start`, `recovery_ready_at`,
+`recovery_active`, `recovery_capped`, `recovery_source`,
+`heating_rate_c_per_hour`, sample/day counts and `recovery_waiting_for_boiler`.
+An unavailable recorder leaves bounded fallback recovery available.
 
 ## Reloading YAML
 

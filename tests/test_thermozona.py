@@ -2233,6 +2233,64 @@ def test_setback_schema_rejects_invalid_offsets(value):
         thermozona.CONFIG_SCHEMA({"thermozona": config})
 
 
+@pytest.mark.asyncio
+async def test_recovery_restores_normal_comfort_early_without_price_boost(fake_hass, monkeypatch):
+    from custom_components.thermozona import thermostat as module
+    from custom_components.thermozona.room_recovery import HeatingRate
+    from custom_components.thermozona.hot_water import HotWaterManager
+    now = datetime(2026, 11, 9, 15, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, "datetime", SimpleNamespace(now=lambda _tz: now))
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("sensor.living", "19")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("schedule.work", "on")
+    fake_hass.states.get("schedule.work").attributes = {"next_event": now+timedelta(hours=2)}
+    thermostat = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work",
+        price_charging=True, schedule_recovery={"enabled": True})
+    thermostat._recovery.profile = HeatingRate(.4, 10, 3)
+    assert thermostat.recovery_plan.active
+    assert thermostat.target_temperature == 20
+    assert thermostat._attr_target_temperature == 20
+    assert thermostat.price_charging_boost == 0
+    # Early recovery is still ordinary demand, subject to the boiler interlock.
+    controller.hot_water = HotWaterManager(fake_hass, {"demand_entity": "input_boolean.dhw"})
+    fake_hass.states.set("input_boolean.dhw", "on")
+    await thermostat._control_heating()
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    assert thermostat.extra_state_attributes["recovery_waiting_for_boiler"]
+    await controller.async_shutdown()
+
+
+@pytest.mark.parametrize("mode,manual,current", [
+    ("cool", HVACMode.AUTO, "19"), ("heat", HVACMode.OFF, "19"),
+    ("heat", HVACMode.AUTO, "unavailable"), ("off", HVACMode.AUTO, "19"),
+])
+def test_recovery_cannot_activate_off_cooling_or_missing_sensor(fake_hass, mode, manual, current):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", mode)
+    fake_hass.states.set("sensor.living", current)
+    fake_hass.states.set("schedule.work", "on")
+    fake_hass.states.get("schedule.work").attributes = {
+        "next_event": datetime.now(timezone.utc)+timedelta(minutes=30)}
+    thermostat = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work",
+        schedule_recovery={"enabled": True})
+    thermostat._manual_mode = manual
+    assert not thermostat.recovery_plan.active
+
+
+@pytest.mark.asyncio
+async def test_recovery_learning_task_is_cancelled_on_removal(fake_hass):
+    controller = HeatPumpController(fake_hass, _config())
+    thermostat = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work",
+        schedule_recovery={"enabled": True})
+    thermostat._recovery_task = asyncio.create_task(asyncio.Event().wait())
+    task = thermostat._recovery_task
+    await thermostat.async_prepare_shutdown()
+    assert task.cancelled()
+    assert thermostat._recovery_task is None
+
+
 @pytest.mark.parametrize("field,value", [("max_temperature", 49), ("target_entity", "switch.boiler"),
                                          ("min_days", 8), ("normal_temperature", "nan")])
 def test_smart_hot_water_schema_rejects_inconsistent_or_invalid_limits(field, value):

@@ -142,6 +142,7 @@ DEFAULT_AIR_COIL_MEASURED_WATER_SENSOR = "sensor.heatpump_heating_out"
 CONF_HYSTERESIS = "hysteresis"
 CONF_SETBACK_SCHEDULE = "setback_schedule"
 CONF_SETBACK_C = "setback_c"
+CONF_SCHEDULE_RECOVERY = "schedule_recovery"
 
 DEFAULT_CONTROL_MODE = CONTROL_MODE_BANG_BANG
 DEFAULT_PWM_CYCLE_TIME = 15
@@ -278,6 +279,22 @@ def _finite_float(value: object) -> float:
     return number
 
 
+def _validate_recovery(config: dict) -> dict:
+    """Keep fallback and safety allowance within the configured hard limit."""
+    if max(config["fallback_minutes"], config["buffer_minutes"]) > config["max_minutes"]:
+        raise vol.Invalid("Recovery fallback and buffer cannot exceed max_minutes")
+    return config
+
+
+RECOVERY_SCHEMA = vol.All(vol.Schema({
+    vol.Optional("enabled", default=False): cv.boolean,
+    vol.Optional("fallback_minutes", default=120): vol.All(vol.Coerce(int), vol.Range(min=5, max=360)),
+    vol.Optional("max_minutes", default=180): vol.All(vol.Coerce(int), vol.Range(min=15, max=360)),
+    vol.Optional("buffer_minutes", default=15): vol.All(vol.Coerce(int), vol.Range(min=5, max=60)),
+    vol.Optional("history_days", default=7): vol.All(vol.Coerce(int), vol.Range(min=2, max=14)),
+}), _validate_recovery)
+
+
 ZONE_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_CIRCUITS): [cv.entity_id],
@@ -287,6 +304,7 @@ ZONE_SCHEMA = vol.Schema(
         vol.Optional(CONF_SETBACK_C, default=1.0): vol.All(
             vol.Coerce(_finite_float), vol.Range(min=0, max=5)
         ),
+        vol.Optional(CONF_SCHEDULE_RECOVERY, default={}): RECOVERY_SCHEMA,
         vol.Optional(CONF_HYSTERESIS): vol.All(
             vol.Coerce(float),
             vol.Range(min=0, max=5),

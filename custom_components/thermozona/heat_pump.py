@@ -149,6 +149,11 @@ class HeatPumpController:
         ))
 
     @property
+    def status_entity(self) -> str | None:
+        """Return the actual status entity ID for history-based room recovery."""
+        return getattr(self._pump_sensor_entity(), "entity_id", None)
+
+    @property
     def space_heating_suspended(self) -> bool:
         """Expose shared-compressor priority without changing the user's mode."""
         return self.hot_water is not None and self.hot_water.blocks_space_heating

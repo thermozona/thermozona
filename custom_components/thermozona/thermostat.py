@@ -45,6 +45,7 @@ from . import (
 )
 from .heat_pump import HeatPumpController
 from .helpers import air_coil_heating_suppressed
+from .room_recovery import RecoveryPlan, RoomRecovery
 from .pro.pwm import (
     calculate_on_time_minutes,
     calculate_pwm_duty,
@@ -102,6 +103,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         price_charging: bool = False,
         setback_schedule: str | None = None,
         setback_c: float = 1.0,
+        schedule_recovery: dict[str, Any] | None = None,
     ) -> None:
         """Initialize the thermostat."""
         self.hass = hass
@@ -167,6 +169,9 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         self._setback_schedule = setback_schedule
         self._setback_c = setback_c
         self._last_setback = 0.0
+        self._recovery = (RoomRecovery(schedule_recovery) if schedule_recovery
+                          and schedule_recovery.get("enabled") and setback_schedule else None)
+        self._recovery_task: asyncio.Task | None = None
         self._air_coil_requested_water_sensor = (
             air_coil_requested_water_sensor or DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR
         )
@@ -237,6 +242,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         await self.async_update_mode_listener()
         await self.async_update_temp_sensor_listener()
         self.async_schedule_control()
+        self._schedule_recovery_learning()
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed."""
@@ -250,6 +256,13 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         """Stop listeners and pending control work before circuits are closed."""
         self._is_removing = True
         self._reschedule_control = False
+        if self._recovery_task is not None:
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
+            self._recovery_task = None
         if self._remove_update_handler is not None:
             self._remove_update_handler()
             self._remove_update_handler = None
@@ -312,12 +325,26 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra diagnostic state attributes."""
+        recovery = self.recovery_plan
         return {
             "control_mode": self._control_mode,
             "comfort_temperature": self._attr_target_temperature,
             "setback_schedule": self._setback_schedule,
+            "setback_c": self._setback_c,
             "setback_active": self.schedule_setback > 0,
             "scheduled_target_temperature": self.target_temperature,
+            "recovery_enabled": self._recovery is not None,
+            "recovery_active": recovery.active,
+            "recovery_start": None if recovery.start is None else recovery.start.isoformat(),
+            "recovery_ready_at": None if recovery.ready_at is None else recovery.ready_at.isoformat(),
+            "recovery_minutes": round(recovery.minutes),
+            "recovery_capped": recovery.capped,
+            "recovery_source": "learned" if self._recovery and self._recovery.profile.rate else "fallback",
+            "heating_rate_c_per_hour": None if self._recovery is None else self._recovery.profile.rate,
+            "heating_rate_samples": 0 if self._recovery is None else self._recovery.profile.samples,
+            "heating_rate_days": 0 if self._recovery is None else self._recovery.profile.days,
+            "recovery_waiting_for_boiler": recovery.active and self._controller.space_heating_suspended,
+            "recovery_error": None if self._recovery is None else self._recovery.error,
             "pwm_duty_cycle": round(self._pwm_duty_cycle, 2),
             "pwm_on_time": round(self._pwm_on_time.total_seconds() / 60, 2),
             "pwm_cycle_time": self._pwm_cycle_time_minutes,
@@ -357,6 +384,47 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         await self._control_heating()
 
     @property
+    def recovery_plan(self) -> RecoveryPlan:
+        """Estimate recovery separately from demand so existing interlocks remain authoritative."""
+        if self._recovery is None:
+            return RecoveryPlan()
+        schedule = self.hass.states.get(self._setback_schedule)
+        mode = self._controller.get_operation_mode()
+        heating = mode in {"heat", "auto"} and not (
+            mode == "auto" and self._controller._last_auto_effective_mode == HVACMode.COOL
+        )
+        return self._recovery.plan(
+            now=datetime.now(timezone.utc),
+            schedule_on=schedule is not None and schedule.state == "on",
+            ready_at=None if schedule is None else getattr(schedule, "attributes", {}).get("next_event"),
+            current=self.current_temperature, target=self._attr_target_temperature,
+            setback=self._setback_c, enabled=heating and self._manual_mode != HVACMode.OFF,
+            cycle_minutes=self._pwm_cycle_time_minutes if self._control_mode == CONTROL_MODE_PWM else 0,
+            prices=self._controller.price_charging._slots,
+            blocked_windows=self._controller.hot_water.reserved_windows() if self._controller.hot_water else [],
+        )
+
+    def _schedule_recovery_learning(self) -> None:
+        """Run history processing outside the control path and cancel it on removal."""
+        if (self._recovery is None or self._recovery_task is not None or self._is_removing
+                or self._manual_mode == HVACMode.OFF or self._temp_sensor is None):
+            return
+        now = datetime.now(timezone.utc)
+        status = self._controller.status_entity
+        if status is None or not self._recovery.learning_due(now):
+            return
+
+        async def learn():
+            try:
+                await self._recovery.async_learn(self.hass, self._temp_sensor, self._circuits, status, now)
+            finally:
+                self._recovery_task = None
+            if not self._is_removing:
+                self.async_schedule_control()
+
+        self._recovery_task = self.hass.async_create_task(learn())
+
+    @property
     def schedule_setback(self) -> float:
         """Lower heating comfort only while the configured absence schedule is on."""
         if not self._setback_schedule or self._manual_mode == HVACMode.OFF:
@@ -367,7 +435,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         ):
             return 0.0
         schedule = self.hass.states.get(self._setback_schedule)
-        return self._setback_c if schedule is not None and schedule.state == "on" else 0.0
+        return self._setback_c if schedule is not None and schedule.state == "on" and not self.recovery_plan.active else 0.0
 
     @property
     def target_temperature(self) -> float:
@@ -382,7 +450,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             not self._price_charging_enabled
             or self._zone_type != "floor"
             or self._manual_mode == HVACMode.OFF
-            or self.schedule_setback > 0
+            or (schedule is not None and schedule.state == "on")
             or (self._setback_schedule is not None and (schedule is None or schedule.state not in {"on", "off"}))
         ):
             return 0.0
@@ -419,6 +487,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
 
     async def _async_update_temp(self, *_) -> None:
         """Update temperature and control heating periodically."""
+        self._schedule_recovery_learning()
         await self._control_heating()
 
     async def _control_heating(self) -> None:
