@@ -23,6 +23,9 @@ CONF_COOLING_BASE_OFFSET = "cooling_base_offset"
 CONF_FLOW_CURVE_OFFSET = "flow_curve_offset"
 CONF_WEATHER_SLOPE_HEAT = "weather_slope_heat"
 CONF_WEATHER_SLOPE_COOL = "weather_slope_cool"
+CONF_AUTO_HEAT_LOCKOUT_ABOVE_C = "auto_heat_lockout_above_c"
+CONF_AUTO_COOL_LOCKOUT_BELOW_C = "auto_cool_lockout_below_c"
+CONF_AUTO_MIN_CHANGEOVER_MINUTES = "auto_min_changeover_minutes"
 CONF_FLOW = "flow"
 CONF_WRITE_DEADBAND_C = "write_deadband_c"
 CONF_WRITE_MIN_INTERVAL_MINUTES = "write_min_interval_minutes"
@@ -48,6 +51,10 @@ CONF_PRO_PREHEAT_GAIN = "preheat_gain"
 CONF_PRO_PREHEAT_SOLAR_GAIN_PER_W_M2 = "preheat_solar_gain_per_w_m2"
 CONF_PRO_PREHEAT_CAP_C = "preheat_cap_c"
 CONF_PRO_PREHEAT_MIN_SLOW_DI = "preheat_min_slow_di"
+CONF_COOLING_DEWPOINT_SENSOR = "cooling_dewpoint_sensor"
+CONF_COOLING_FLOOR_DEWPOINT_MARGIN = "cooling_floor_dewpoint_margin"
+CONF_COOLING_DEHUMIDIFICATION_MIN_FLOW = "cooling_dehumidification_min_flow"
+CONF_COOLING_AIR_COIL_ONLY_OFFSET = "cooling_air_coil_only_offset"
 CONF_CONTROL_MODE = "control_mode"
 CONF_PWM_CYCLE_TIME = "pwm_cycle_time"
 CONF_PWM_MIN_ON_TIME = "pwm_min_on_time"
@@ -57,18 +64,30 @@ CONF_PWM_KI = "pwm_ki"
 CONF_PWM_ACTUATOR_DELAY = "pwm_actuator_delay"
 CONF_ZONE_RESPONSE = "zone_response"
 CONF_ZONE_FLOW_WEIGHT = "zone_flow_weight"
+CONF_ZONE_HEATING_MIN_FLOW = "heating_min_flow_c"
 CONF_ZONE_SOLAR_WEIGHT = "zone_solar_weight"
+CONF_ZONE_TYPE = "zone_type"
+CONF_FLOOR_MATERIAL = "floor_material"
+CONF_COOLING_DEWPOINT_MARGIN = "cooling_dewpoint_margin"
+CONF_COOLING_DEWPOINT_PROTECTION = "cooling_dewpoint_protection"
 
 CONTROL_MODE_BANG_BANG = "bang_bang"
 CONTROL_MODE_PWM = "pwm"
 ZONE_RESPONSE_SLOW = "slow"
 ZONE_RESPONSE_FAST = "fast"
+ZONE_TYPE_FLOOR = "floor"
+ZONE_TYPE_WALL = "wall"
+ZONE_TYPE_AIR_COIL = "air_coil"
+FLOOR_MATERIAL_WOOD = "wood"
 
 DEFAULT_HEATING_BASE_OFFSET = 3.0
 DEFAULT_COOLING_BASE_OFFSET = 2.5
 DEFAULT_FLOW_CURVE_OFFSET = 0.0
 DEFAULT_WEATHER_SLOPE_HEAT = 0.25
 DEFAULT_WEATHER_SLOPE_COOL = 0.2
+DEFAULT_AUTO_HEAT_LOCKOUT_ABOVE_C = 18.0
+DEFAULT_AUTO_COOL_LOCKOUT_BELOW_C = 20.0
+DEFAULT_AUTO_MIN_CHANGEOVER_MINUTES = 30
 DEFAULT_PRO_KP = 1.0
 DEFAULT_PRO_USE_INTEGRAL = False
 DEFAULT_PRO_TI_MINUTES = 180
@@ -93,6 +112,10 @@ DEFAULT_PRO_PREHEAT_GAIN = 0.35
 DEFAULT_PRO_PREHEAT_SOLAR_GAIN_PER_W_M2 = 0.0
 DEFAULT_PRO_PREHEAT_CAP_C = 1.2
 DEFAULT_PRO_PREHEAT_MIN_SLOW_DI = 0.25
+DEFAULT_COOLING_DEWPOINT_SENSOR = None
+DEFAULT_COOLING_FLOOR_DEWPOINT_MARGIN = 2.0
+DEFAULT_COOLING_DEHUMIDIFICATION_MIN_FLOW = 5.0
+DEFAULT_COOLING_AIR_COIL_ONLY_OFFSET = 0.0
 DEFAULT_ZONE_RESPONSE = ZONE_RESPONSE_SLOW
 DEFAULT_ZONE_FLOW_WEIGHT = 1.0
 DEFAULT_ZONE_SOLAR_WEIGHT = 1.0
@@ -204,6 +227,22 @@ FLOW_SCHEMA = vol.Schema(
             CONF_PRO_PREHEAT_MIN_SLOW_DI,
             default=DEFAULT_PRO_PREHEAT_MIN_SLOW_DI,
         ): vol.All(vol.Coerce(float), vol.Range(min=0, max=1)),
+        vol.Optional(
+            CONF_COOLING_DEWPOINT_SENSOR,
+            default=DEFAULT_COOLING_DEWPOINT_SENSOR,
+        ): vol.Any(None, cv.entity_id),
+        vol.Optional(
+            CONF_COOLING_FLOOR_DEWPOINT_MARGIN,
+            default=DEFAULT_COOLING_FLOOR_DEWPOINT_MARGIN,
+        ): vol.All(vol.Coerce(float), vol.Range(min=0, max=10)),
+        vol.Optional(
+            CONF_COOLING_DEHUMIDIFICATION_MIN_FLOW,
+            default=DEFAULT_COOLING_DEHUMIDIFICATION_MIN_FLOW,
+        ): vol.All(vol.Coerce(float), vol.Range(min=5, max=25)),
+        vol.Optional(
+            CONF_COOLING_AIR_COIL_ONLY_OFFSET,
+            default=DEFAULT_COOLING_AIR_COIL_ONLY_OFFSET,
+        ): vol.All(vol.Coerce(float), vol.Range(min=0, max=15)),
     }
 )
 
@@ -223,10 +262,26 @@ ZONE_SCHEMA = vol.Schema(
             CONF_ZONE_FLOW_WEIGHT,
             default=DEFAULT_ZONE_FLOW_WEIGHT,
         ): vol.All(vol.Coerce(float), vol.Range(min=0, max=2)),
+        vol.Optional(CONF_ZONE_HEATING_MIN_FLOW): vol.All(
+            vol.Coerce(float), vol.Range(min=15, max=35)
+        ),
         vol.Optional(
             CONF_ZONE_SOLAR_WEIGHT,
             default=DEFAULT_ZONE_SOLAR_WEIGHT,
         ): vol.All(vol.Coerce(float), vol.Range(min=0, max=2)),
+        vol.Optional(
+            CONF_ZONE_TYPE,
+            default=ZONE_TYPE_FLOOR,
+        ): vol.In([ZONE_TYPE_FLOOR, ZONE_TYPE_WALL, ZONE_TYPE_AIR_COIL]),
+        vol.Optional(CONF_FLOOR_MATERIAL): cv.string,
+        vol.Optional(CONF_COOLING_DEWPOINT_MARGIN): vol.All(
+            vol.Coerce(float),
+            vol.Range(min=0, max=10),
+        ),
+        vol.Optional(
+            CONF_COOLING_DEWPOINT_PROTECTION,
+            default=True,
+        ): cv.boolean,
         vol.Optional(
             CONF_CONTROL_MODE,
             default=DEFAULT_CONTROL_MODE,
@@ -283,6 +338,18 @@ CONFIG_SCHEMA = vol.Schema({
             CONF_WEATHER_SLOPE_COOL,
             default=DEFAULT_WEATHER_SLOPE_COOL,
         ): vol.Coerce(float),
+        vol.Optional(
+            CONF_AUTO_HEAT_LOCKOUT_ABOVE_C,
+            default=DEFAULT_AUTO_HEAT_LOCKOUT_ABOVE_C,
+        ): vol.All(vol.Coerce(float), vol.Range(min=-30, max=50)),
+        vol.Optional(
+            CONF_AUTO_COOL_LOCKOUT_BELOW_C,
+            default=DEFAULT_AUTO_COOL_LOCKOUT_BELOW_C,
+        ): vol.All(vol.Coerce(float), vol.Range(min=-30, max=50)),
+        vol.Optional(
+            CONF_AUTO_MIN_CHANGEOVER_MINUTES,
+            default=DEFAULT_AUTO_MIN_CHANGEOVER_MINUTES,
+        ): vol.All(vol.Coerce(int), vol.Range(min=0, max=1440)),
         vol.Optional(
             CONF_FLOW,
             default={},
@@ -368,14 +435,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id] = validated_config
 
+    from .heat_pump import HeatPumpController
+
+    controllers = hass.data[DOMAIN].setdefault("controllers", {})
+    controller = controllers.get(entry.entry_id)
+    if controller is None:
+        controller = HeatPumpController(hass, validated_config)
+        controllers[entry.entry_id] = controller
+    else:
+        controller.refresh_entry_config(validated_config)
+    controller.begin_platform_setup()
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    controllers = hass.data.get(DOMAIN, {}).get("controllers", {})
+    controller = controllers.get(entry.entry_id)
+    if controller is not None:
+        await controller.async_shutdown()
+
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok and DOMAIN in hass.data:
-        controllers = hass.data[DOMAIN].get("controllers")
         if controllers:
             controllers.pop(entry.entry_id, None)
             if not controllers:

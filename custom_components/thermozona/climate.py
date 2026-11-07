@@ -15,12 +15,16 @@ from . import (
     CONF_PWM_MIN_OFF_TIME,
     CONF_PWM_MIN_ON_TIME,
     CONF_TEMP_SENSOR,
+    CONF_COOLING_DEWPOINT_MARGIN,
+    CONF_COOLING_DEWPOINT_PROTECTION,
+    CONF_FLOOR_MATERIAL,
     CONF_ZONE_FLOW_WEIGHT,
+    CONF_ZONE_HEATING_MIN_FLOW,
     CONF_ZONE_RESPONSE,
     CONF_ZONE_SOLAR_WEIGHT,
+    CONF_ZONE_TYPE,
     DOMAIN,
 )
-from .heat_pump import HeatPumpController
 from .helpers import resolve_circuits
 from .thermostat import ThermozonaThermostat
 
@@ -39,13 +43,7 @@ async def async_setup_entry(
     zones = entry_config.get("zones", {})
     _LOGGER.debug("Found zones: %s", zones)
 
-    controllers = domain_data.setdefault("controllers", {})
-    controller = controllers.get(config_entry.entry_id)
-    if controller is None:
-        controller = HeatPumpController(hass, entry_config)
-    else:
-        controller.refresh_entry_config(entry_config)
-    controllers[config_entry.entry_id] = controller
+    controller = domain_data["controllers"][config_entry.entry_id]
 
     entities: list[ThermozonaThermostat] = []
     for zone_name, config in zones.items():
@@ -77,6 +75,11 @@ async def async_setup_entry(
                 config.get(CONF_ZONE_RESPONSE),
                 config.get(CONF_ZONE_FLOW_WEIGHT),
                 config.get(CONF_ZONE_SOLAR_WEIGHT),
+                config.get(CONF_ZONE_TYPE),
+                config.get(CONF_FLOOR_MATERIAL),
+                config.get(CONF_COOLING_DEWPOINT_MARGIN),
+                config.get(CONF_COOLING_DEWPOINT_PROTECTION),
+                config.get(CONF_ZONE_HEATING_MIN_FLOW),
             )
         )
 

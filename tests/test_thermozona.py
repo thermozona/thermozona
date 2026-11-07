@@ -1,17 +1,31 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+import voluptuous as vol
 
-from custom_components.thermozona.helpers import resolve_circuits
-from custom_components.thermozona.heat_pump import HeatPumpController
-from custom_components.thermozona.sensor import ThermozonaFlowTemperatureSensor
-from custom_components.thermozona.select import ThermozonaHeatPumpModeSelect
-from custom_components.thermozona.thermostat import ThermozonaThermostat
 from homeassistant.components.climate import HVACAction, HVACMode
 from homeassistant.const import ATTR_TEMPERATURE
+
+from custom_components import thermozona
+from custom_components.thermozona import heat_pump as heat_pump_module
+from custom_components.thermozona.helpers import (
+    air_coil_heating_suppressed,
+    resolve_circuits,
+)
+from custom_components.thermozona.heat_pump import HeatPumpController
+from custom_components.thermozona.pro import flow_supervisor as flow_supervisor_module
+from custom_components.thermozona.pro.number import ThermozonaFlowCurveOffsetNumber
+from custom_components.thermozona.sensor import ThermozonaFlowTemperatureSensor
+from custom_components.thermozona.select import (
+    ThermozonaHeatPumpModeSelect,
+    ThermozonaZoneStrategySelect,
+)
+from custom_components.thermozona.thermostat import ThermozonaThermostat
 
 
 class DummyNumber:
@@ -78,24 +92,156 @@ def _config(**overrides):
     return base
 
 
+def _create_thermostat(fake_hass, controller, **zone_options):
+    return ThermozonaThermostat(
+        fake_hass,
+        "entry-1",
+        "living_room",
+        ["switch.zone_1"],
+        "sensor.living",
+        controller,
+        hysteresis=0.2,
+        control_mode=None,
+        pwm_cycle_time=None,
+        pwm_min_on_time=None,
+        pwm_min_off_time=None,
+        pwm_kp=None,
+        pwm_ki=None,
+        pwm_actuator_delay=None,
+        **zone_options,
+    )
+
+
 def test_resolve_circuits_supports_new_and_legacy_keys():
     assert resolve_circuits({"circuits": ["switch.a"]}) == ["switch.a"]
     assert resolve_circuits({"groups": ["switch.b"]}) == ["switch.b"]
     assert resolve_circuits({}) == []
 
 
-def test_auto_mode_and_flow_temperature_calculation_uses_zone_status():
-    controller = HeatPumpController(SimpleNamespace(states=None), _config())
+def test_schema_accepts_zone_and_cooling_options():
+    config = _config(
+        flow={
+            "cooling_dewpoint_sensor": "sensor.dewpoint",
+            "cooling_floor_dewpoint_margin": 2.0,
+            "cooling_dehumidification_min_flow": 5.0,
+            "cooling_air_coil_only_offset": 5.0,
+        }
+    )
+    config["zones"]["living_room"].update(
+        zone_type="wall",
+        heating_min_flow_c=32.0,
+        floor_material="wood",
+        cooling_dewpoint_margin=3.0,
+        cooling_dewpoint_protection=False,
+    )
+
+    validated = thermozona.CONFIG_SCHEMA({"thermozona": config})["thermozona"]
+
+    assert validated["zones"]["living_room"]["heating_min_flow_c"] == 32.0
+    assert validated["zones"]["living_room"]["cooling_dewpoint_protection"] is False
+    assert validated["auto_heat_lockout_above_c"] == 18.0
+    assert validated["auto_cool_lockout_below_c"] == 20.0
+    assert validated["auto_min_changeover_minutes"] == 30
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("zone_type", "radiator"),
+        ("heating_min_flow_c", 36),
+        ("heating_min_flow_c", 14),
+        ("cooling_dewpoint_margin", -1),
+    ],
+)
+def test_schema_rejects_invalid_zone_options(key, value):
+    config = _config()
+    config["zones"]["living_room"][key] = value
+
+    with pytest.raises(vol.Invalid):
+        thermozona.CONFIG_SCHEMA({"thermozona": config})
+
+
+def test_auto_mode_and_flow_temperature_calculation_uses_zone_status(fake_hass):
+    controller = HeatPumpController(
+        fake_hass, _config(auto_min_changeover_minutes=0)
+    )
+    fake_hass.states.set("sensor.outside", "5")
     controller.update_zone_status("living", target=21, current=19, active=True)
     assert controller.determine_auto_mode() == HVACMode.HEAT
 
     flow = controller.determine_flow_temperature(HVACMode.HEAT, outside_temp=5)
     assert flow > 24
 
+    fake_hass.states.set("sensor.outside", "30")
     controller.update_zone_status("living", target=21, current=23, active=True)
     assert controller.determine_auto_mode() == HVACMode.COOL
     cool_flow = controller.determine_flow_temperature(HVACMode.COOL, outside_temp=30)
     assert 15 <= cool_flow <= 25
+
+
+@pytest.mark.parametrize(
+    ("outside", "current", "expected"),
+    [
+        (18, 19, HVACMode.HEAT),
+        (19, 19, HVACMode.OFF),
+        (19, 23, HVACMode.OFF),
+        (20, 23, HVACMode.COOL),
+        (10, 21, HVACMode.OFF),
+        ("unknown", 19, HVACMode.OFF),
+        ("unavailable", 19, HVACMode.OFF),
+        ("nan", 19, HVACMode.OFF),
+        ("inf", 19, HVACMode.OFF),
+    ],
+)
+def test_auto_mode_respects_outdoor_lockouts_and_idle_demand(
+    fake_hass, outside, current, expected
+):
+    controller = HeatPumpController(fake_hass, _config())
+    fake_hass.states.set("sensor.outside", str(outside))
+    controller.update_zone_status("living", target=21, current=current)
+
+    assert controller.determine_auto_mode() == expected
+
+
+def test_auto_mode_uses_zone_weights(fake_hass):
+    controller = HeatPumpController(
+        fake_hass,
+        _config(
+            auto_heat_lockout_above_c=30,
+            auto_cool_lockout_below_c=0,
+            auto_min_changeover_minutes=0,
+        ),
+    )
+    fake_hass.states.set("sensor.outside", "15")
+    controller.update_zone_status("cold", target=21, current=19, zone_flow_weight=2)
+    controller.update_zone_status("warm", target=21, current=23, zone_flow_weight=0.2)
+
+    assert controller.determine_auto_mode() == HVACMode.HEAT
+
+    controller.update_zone_status("warm", target=21, current=23, zone_flow_weight=3)
+
+    assert controller.determine_auto_mode() == HVACMode.COOL
+
+
+def test_auto_mode_waits_idle_until_changeover_expires(fake_hass, monkeypatch):
+    now = datetime(2026, 10, 18, 12, tzinfo=timezone.utc)
+    clock = SimpleNamespace(now=now)
+    monkeypatch.setattr(
+        heat_pump_module, "datetime", SimpleNamespace(now=lambda _tz: clock.now)
+    )
+    controller = HeatPumpController(
+        fake_hass,
+        _config(auto_heat_lockout_above_c=30, auto_cool_lockout_below_c=0),
+    )
+    fake_hass.states.set("sensor.outside", "20")
+    controller._last_auto_mode_change = now - timedelta(minutes=10)
+    controller.update_zone_status("living", target=21, current=23)
+
+    assert controller.determine_auto_mode() == HVACMode.OFF
+
+    clock.now = now + timedelta(minutes=20)
+
+    assert controller.determine_auto_mode() == HVACMode.COOL
 
 
 @pytest.mark.asyncio
@@ -480,6 +626,56 @@ def test_pro_slew_rate_is_asymmetric(fake_hass):
     assert round(increased - decreased, 3) >= 0.0
 
 
+def test_active_zone_heating_minimum_ramps_up_and_down(fake_hass, monkeypatch):
+    clock = SimpleNamespace(now=datetime(2026, 10, 18, 12, tzinfo=timezone.utc))
+    monkeypatch.setattr(
+        flow_supervisor_module, "datetime", SimpleNamespace(now=lambda _tz: clock.now)
+    )
+    controller = HeatPumpController(fake_hass, _config())
+    controller.update_zone_status("floor", target=21, current=20, active=True)
+    controller.update_zone_status(
+        "wall", target=21, current=20, active=True, heating_min_flow_c=32
+    )
+    first, factors = controller.determine_flow_temperature_with_factors(HVACMode.HEAT, 15)
+    assert first == 32.0
+    assert factors["active_min_flow_zones"] == ["wall"]
+
+    controller.update_zone_status("wall", target=21, current=21, active=False)
+    clock.now += timedelta(minutes=5)
+    lowered, factors = controller.determine_flow_temperature_with_factors(HVACMode.HEAT, 15)
+    assert lowered == 30.0
+    assert factors["active_min_flow_zones"] == []
+
+    controller.update_zone_status(
+        "wall", target=21, current=20, active=True, heating_min_flow_c=32
+    )
+    clock.now += timedelta(minutes=5)
+    raised = controller.determine_flow_temperature(HVACMode.HEAT, 15)
+    assert raised == 31.5
+
+
+@pytest.mark.asyncio
+async def test_entry_setup_shares_controller_across_platforms(fake_hass, monkeypatch):
+    from custom_components.thermozona import climate, number, select, sensor
+
+    monkeypatch.setattr(thermozona, "_async_load_yaml_config", AsyncMock(return_value=_config()))
+    entry = SimpleNamespace(entry_id="entry-1", data={})
+
+    assert await thermozona.async_setup_entry(fake_hass, entry)
+    controller = fake_hass.data["thermozona"]["controllers"][entry.entry_id]
+    assert controller.get_operation_mode() == "off"
+    entities = []
+    for platform in [climate, number, select, sensor]:
+        await platform.async_setup_entry(fake_hass, entry, entities.extend)
+
+    assert entities
+    assert all(entity._controller is controller for entity in entities)
+    assert any(isinstance(entity, ThermozonaZoneStrategySelect) for entity in entities)
+    assert await thermozona.async_unload_entry(fake_hass, entry)
+    assert entry.entry_id not in fake_hass.data["thermozona"]
+    assert "controllers" not in fake_hass.data["thermozona"]
+
+
 def test_get_operation_mode_maps_external_states(fake_hass):
     controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
 
@@ -491,6 +687,34 @@ def test_get_operation_mode_maps_external_states(fake_hass):
 
     fake_hass.states.set("sensor.mode", "idle")
     assert controller.get_operation_mode() == "off"
+
+
+@pytest.mark.parametrize("state", [None, "unknown", "unavailable", "invalid"])
+def test_unavailable_external_mode_keeps_controller_off(fake_hass, state):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    if state is not None:
+        fake_hass.states.set("sensor.mode", state)
+
+    assert controller.get_operation_mode() == "off"
+
+
+@pytest.mark.parametrize("first_platform", ["number", "select"])
+def test_startup_waits_for_mode_and_flow_platforms(fake_hass, first_platform):
+    controller = HeatPumpController(fake_hass, _config())
+    number = DummyNumber()
+    select = DummySelect()
+    registrations = {
+        "number": lambda: controller.register_flow_temperature_number(number),
+        "select": lambda: controller.register_mode_select(select),
+    }
+    controller.begin_platform_setup()
+    assert controller.get_operation_mode() == "off"
+
+    registrations.pop(first_platform)()
+    assert controller.get_operation_mode() == "off"
+
+    next(iter(registrations.values()))()
+    assert controller.get_operation_mode() == "auto"
 
 
 @pytest.mark.asyncio
@@ -596,6 +820,113 @@ async def test_thermostat_turn_off_closes_circuits(fake_hass):
 
     assert thermostat.hvac_mode == HVACMode.OFF
     assert fake_hass.states.get("switch.zone_2").state == "off"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("temperature", [None, "unknown", "unavailable", "nan", "inf"])
+async def test_invalid_room_temperature_closes_circuits_and_clears_demand(
+    fake_hass, temperature
+):
+    controller = HeatPumpController(fake_hass, _config())
+    thermostat = _create_thermostat(fake_hass, controller)
+    sensor = ThermozonaFlowTemperatureSensor("entry-1", controller)
+    controller.register_flow_temperature_sensor(sensor)
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("switch.zone_1", "on")
+    controller.update_zone_status("living_room", target=21, current=19, active=True)
+    await controller.async_update_heat_pump_state()
+    assert sensor.extra_state_attributes["command_active"] is True
+    cached_flow = sensor._attr_native_value
+    if temperature is not None:
+        fake_hass.states.set("sensor.living", temperature)
+
+    await thermostat._control_heating()
+
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    assert controller._pump_state == "idle"
+    assert "living_room" not in controller._zone_status
+    assert sensor.extra_state_attributes["command_active"] is False
+    assert sensor.extra_state_attributes["active_zones"] == []
+    assert sensor._attr_native_value == cached_flow
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_control_before_closing_circuits(fake_hass):
+    controller = HeatPumpController(fake_hass, _config())
+    thermostat = _create_thermostat(fake_hass, controller)
+    controller.register_thermostat(thermostat)
+    started = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def pending_control():
+        started.set()
+        await resume.wait()
+        await thermostat._set_circuits_state(True)
+
+    thermostat._control_heating = pending_control
+    thermostat.async_schedule_control()
+    await started.wait()
+    task = thermostat._control_task
+    removers = [Mock(), Mock(), Mock()]
+    (
+        thermostat._remove_update_handler,
+        thermostat._remove_mode_listener,
+        thermostat._remove_temp_sensor_listener,
+    ) = removers
+    fake_hass.states.set("switch.zone_1", "on")
+
+    await controller.async_shutdown()
+    thermostat.async_schedule_control()
+
+    assert task.cancelled()
+    assert thermostat._control_task is None
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    assert controller._pump_state == "idle"
+    assert controller._zone_status == {}
+    for remove in removers:
+        remove.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_demand_off_delay_expires_without_another_zone_update(fake_hass, monkeypatch):
+    clock = SimpleNamespace(now=datetime(2026, 10, 18, 12, tzinfo=timezone.utc))
+    monkeypatch.setattr(
+        heat_pump_module, "datetime", SimpleNamespace(now=lambda _tz: clock.now)
+    )
+    wake = asyncio.Event()
+    scheduled = asyncio.Event()
+    delays = []
+
+    async def controlled_sleep(seconds):
+        delays.append(seconds)
+        scheduled.set()
+        await wake.wait()
+
+    monkeypatch.setattr(
+        heat_pump_module,
+        "asyncio",
+        SimpleNamespace(sleep=controlled_sleep, CancelledError=asyncio.CancelledError),
+    )
+    controller = HeatPumpController(fake_hass, _config())
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("switch.zone_1", "on")
+    controller.update_zone_status("living", target=21, current=19, active=True)
+    await controller.async_update_heat_pump_state()
+    fake_hass.states.set("switch.zone_1", "off")
+
+    await controller.async_update_heat_pump_state()
+    task = controller._demand_off_task
+    await scheduled.wait()
+    assert controller._pump_state == "heat"
+    assert delays == [300.0]
+
+    clock.now += timedelta(minutes=5)
+    wake.set()
+    await task
+
+    assert controller._pump_state == "idle"
+    assert controller._demand_off_task is None
+    assert controller._last_flow_factors["command_active"] is False
 
 
 def test_name_helpers_cover_slugify_and_prettify():
@@ -770,6 +1101,153 @@ def test_flow_curve_offset_is_applied_in_heating_and_cooling(fake_hass):
     assert cooling == 16.5
 
 
+@pytest.mark.parametrize(
+    ("material", "margin", "expected"),
+    [(None, None, 20.0), ("wood", None, 21.0), ("wood", 2.0, 20.0)],
+)
+def test_floor_cooling_flow_respects_dewpoint_margin(fake_hass, material, margin, expected):
+    controller = HeatPumpController(
+        fake_hass, _config(flow={"cooling_dewpoint_sensor": "sensor.dewpoint"})
+    )
+    fake_hass.states.set("sensor.dewpoint", "18")
+    controller.update_zone_status(
+        "living", target=21, current=24, active=True,
+        floor_material=material, cooling_dewpoint_margin=margin,
+    )
+
+    flow, factors = controller.determine_flow_temperature_with_factors(HVACMode.COOL, 24)
+
+    assert flow == expected
+    assert factors["cooling_floor_constraint_c"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dewpoint", "protection", "expected"),
+    [("16", True, "on"), ("unavailable", True, "off"), ("24", True, "off"),
+     ("unavailable", False, "on")],
+)
+async def test_floor_cooling_closes_when_dewpoint_is_unsafe(
+    fake_hass, dewpoint, protection, expected
+):
+    controller = HeatPumpController(
+        fake_hass,
+        _config(
+            heat_pump_mode="sensor.mode",
+            flow={"cooling_dewpoint_sensor": "sensor.dewpoint"},
+        ),
+    )
+    thermostat = _create_thermostat(
+        fake_hass, controller, cooling_dewpoint_protection=protection
+    )
+    fake_hass.states.set("sensor.mode", "cool")
+    fake_hass.states.set("sensor.outside", "30")
+    fake_hass.states.set("sensor.living", "24")
+    fake_hass.states.set("sensor.dewpoint", dewpoint)
+    fake_hass.states.set("switch.zone_1", "off")
+
+    await thermostat.async_set_temperature(**{ATTR_TEMPERATURE: 21})
+
+    assert fake_hass.states.get("switch.zone_1").state == expected
+    assert thermostat._attr_hvac_action == (
+        HVACAction.COOLING if expected == "on" else HVACAction.IDLE
+    )
+
+
+def test_colder_air_coil_demand_suppresses_floor_cooling(fake_hass):
+    controller = HeatPumpController(
+        fake_hass, _config(flow={"cooling_dewpoint_sensor": "sensor.dewpoint"})
+    )
+    fake_hass.states.set("sensor.outside", "30")
+    fake_hass.states.set("sensor.dewpoint", "18")
+    controller.update_zone_status(
+        "air", target=21, current=24, active=True, zone_type="air_coil"
+    )
+
+    assert controller.should_suppress_floor_cooling(
+        zone_type="floor", target=21, current=24,
+        floor_material=None, cooling_dewpoint_margin=None,
+    )
+    assert not controller.should_suppress_floor_cooling(
+        zone_type="air_coil", target=21, current=24,
+        floor_material=None, cooling_dewpoint_margin=None,
+    )
+
+
+def test_air_coil_only_cooling_can_request_dehumidification_flow(fake_hass):
+    controller = HeatPumpController(
+        fake_hass,
+        _config(flow={"cooling_air_coil_only_offset": 15.0,
+                      "cooling_dehumidification_min_flow": 5.0}),
+    )
+    controller.update_zone_status(
+        "air", target=21, current=24, active=True, zone_type="air_coil"
+    )
+
+    flow, factors = controller.determine_flow_temperature_with_factors(HVACMode.COOL, 30)
+
+    assert flow == 5.0
+    assert factors["cooling_air_coil_only_mode"] is True
+    assert factors["cooling_active_air_coil_zones"] == ["air"]
+
+
+@pytest.mark.asyncio
+async def test_missing_dewpoint_blocks_command_until_floor_is_closed(fake_hass):
+    controller = HeatPumpController(
+        fake_hass,
+        _config(heat_pump_mode="sensor.mode",
+                flow={"cooling_dewpoint_sensor": "sensor.dewpoint"}),
+    )
+    fake_hass.states.set("sensor.mode", "cool")
+    fake_hass.states.set("sensor.outside", "30")
+    controller.update_zone_status("floor", target=21, current=24, active=True)
+
+    assert await controller._async_set_flow_temperature() is None
+    assert controller._last_flow_factors["command_active"] is False
+    assert not fake_hass.services.calls
+
+
+@pytest.mark.parametrize(
+    ("requested", "measured", "previous", "expected"),
+    [(27, 24, False, True), (24, 27, False, True), (26, 26, False, False),
+     (26, 24, True, True), (25, 25, True, False), (None, 24, False, True),
+     (24, None, False, True)],
+)
+def test_air_coil_water_interlock_hysteresis(requested, measured, previous, expected):
+    assert air_coil_heating_suppressed(requested, measured, previous) is expected
+
+
+@pytest.mark.asyncio
+async def test_air_coil_heating_reopens_only_after_water_cools(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    thermostat = _create_thermostat(fake_hass, controller, zone_type="air_coil")
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("sensor.living", "19")
+    fake_hass.states.set("switch.zone_1", "off")
+    fake_hass.states.set("sensor.thermozona_flow_temperature", "24")
+
+    for water, expected in [(27, "off"), (26, "off"), (25, "on")]:
+        fake_hass.states.set("sensor.heatpump_heating_out", str(water))
+        await thermostat.async_set_temperature(**{ATTR_TEMPERATURE: 21})
+        assert fake_hass.states.get("switch.zone_1").state == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restored", [2.5, None, 11.0, -11.0, float("nan")])
+async def test_flow_curve_offset_restores_only_valid_values(fake_hass, restored):
+    controller = HeatPumpController(fake_hass, _config(flow_curve_offset=1.5))
+    number = ThermozonaFlowCurveOffsetNumber("entry-1", controller)
+    number.async_get_last_number_data = AsyncMock(
+        return_value=SimpleNamespace(native_value=restored)
+    )
+
+    await number.async_added_to_hass()
+
+    assert number.native_value == (2.5 if restored == 2.5 else 1.5)
+    assert controller.get_flow_curve_offset() == number.native_value
+
+
 def test_refresh_entry_config_resets_ui_override(fake_hass):
     controller = HeatPumpController(fake_hass, _config(flow_curve_offset=2.0))
     controller.set_flow_curve_offset(5.0)
@@ -825,6 +1303,54 @@ def test_mode_select_options_are_stable(fake_hass):
     )
 
     assert select._attr_options == ["auto", "heat", "cool", "off"]
+
+
+@pytest.mark.asyncio
+async def test_mode_select_restores_before_releasing_startup_guard(fake_hass):
+    controller = HeatPumpController(fake_hass, _config())
+    controller.begin_platform_setup()
+    number = DummyNumber()
+    controller.register_flow_temperature_number(number)
+    select = ThermozonaHeatPumpModeSelect("entry-1", controller)
+    select.entity_id = "select.mode"
+    select.async_get_last_state = AsyncMock(return_value=SimpleNamespace(state="cool"))
+
+    await select.async_added_to_hass()
+
+    assert select._attr_current_option == "cool"
+    assert controller.get_operation_mode() == "cool"
+
+
+@pytest.mark.asyncio
+async def test_cooling_strategy_restores_and_blocks_floor_zones(fake_hass):
+    controller = HeatPumpController(fake_hass, _config())
+    controller._async_refresh_after_strategy_change = AsyncMock()
+    tasks = []
+
+    def create_task(coro):
+        task = asyncio.create_task(coro)
+        tasks.append(task)
+        return task
+
+    fake_hass.async_create_task = create_task
+    select = ThermozonaZoneStrategySelect("entry-1", controller)
+    select.async_get_last_state = AsyncMock(
+        return_value=SimpleNamespace(state="air_coil_only")
+    )
+
+    await select.async_added_to_hass()
+    await asyncio.gather(*tasks)
+
+    assert select._attr_current_option == "air_coil_only"
+    assert controller.should_suppress_floor_cooling(
+        zone_type="floor", target=21, current=24,
+        floor_material=None, cooling_dewpoint_margin=None,
+    )
+    with pytest.raises(ValueError):
+        await select.async_select_option("invalid")
+    await select.async_select_option("auto")
+    await asyncio.gather(*tasks)
+    assert not controller.is_air_coil_only_override_enabled()
 
 
 @pytest.mark.asyncio

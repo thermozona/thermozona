@@ -31,6 +31,7 @@ class ProFlowSupervisor:
         self._integral = 0.0
         self._last_eval_time: datetime | None = None
         self._last_flow = 30.0
+        self._last_command_flow: float | None = None
 
     def reset(self) -> None:
         """Reset adaptive state after reload/reconfiguration."""
@@ -38,6 +39,7 @@ class ProFlowSupervisor:
         self._integral = 0.0
         self._last_eval_time = None
         self._last_flow = 30.0
+        self._last_command_flow = None
 
     def compute_heating_flow(
         self,
@@ -83,6 +85,7 @@ class ProFlowSupervisor:
         demand_entries = self._build_zone_demands(zone_status, dt_minutes, config)
         if not demand_entries:
             self._last_eval_time = now
+            self._last_command_flow = None
             breakdown = {
                 "target_ref_c": None,
                 "di_slow": 0.0,
@@ -179,7 +182,33 @@ class ProFlowSupervisor:
         self._last_eval_time = now
         self._last_flow = smoothed_flow
 
-        clamped_flow = self._clamp(smoothed_flow, 15.0, 35.0)
+        # A wall zone may need hotter water than the floor-oriented curve.
+        # Apply its minimum only while its valve is open and it still needs heat.
+        # Keep this separate from the smoothed base curve so the high-temperature
+        # request ramps away promptly when the zone closes, rather than following
+        # the much slower normal floor-heating slew-down.
+        active_minima = [
+            (name, float(status["heating_min_flow_c"]))
+            for name, status in zone_status.items()
+            if status.get("active")
+            and status.get("heating_min_flow_c") is not None
+            and float(status["current"]) < float(status["target"])
+        ]
+        active_min_flow = max((minimum for _, minimum in active_minima), default=None)
+        target_flow = self._clamp(
+            max(smoothed_flow, active_min_flow or smoothed_flow), 15.0, 35.0
+        )
+        if self._last_command_flow is None:
+            clamped_flow = target_flow
+        else:
+            # The wall circuit cycles with room temperature. Ramp its shared
+            # water request instead of jumping 8°C each time its valve toggles.
+            clamped_flow = self._clamp(
+                target_flow,
+                self._last_command_flow - 2.0 * dt_minutes / 5.0,
+                self._last_command_flow + 1.5 * dt_minutes / 5.0,
+            )
+        self._last_command_flow = clamped_flow
         breakdown = {
             "target_ref_c": round(float(target_ref), 3),
             "di_slow": round(float(di_slow), 6),
@@ -196,6 +225,9 @@ class ProFlowSupervisor:
             "preheat_boost_c": round(float(preheat_boost), 3),
             "flow_temp_unclamped_c": round(float(raw_flow), 3),
             "flow_temp_smoothed_c": round(float(smoothed_flow), 3),
+            "active_zone_min_flow_c": active_min_flow,
+            "active_min_flow_zones": [name for name, _ in active_minima],
+            "zone_min_target_flow_c": round(target_flow, 3),
             "flow_temp_c": round(float(clamped_flow), 1),
             "clamp_min_c": 15.0,
             "clamp_max_c": 35.0,
