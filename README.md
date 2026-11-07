@@ -213,6 +213,8 @@ thermozona:
 | `zone_flow_weight` | No | `1.0` | Demand weighting for heating flow and automatic heat/cool selection. |
 | `zone_solar_weight` | No | `1.0` | Solar softening weight for preheat compensation. |
 | `zone_type` | No | `floor` | `floor`, `wall`, or `air_coil`. |
+| `air_coil_requested_water_sensor` | No | `sensor.thermozona_flow_temperature` | Requested supply-water temperature entity in °C for the air-coil heating interlock. |
+| `air_coil_measured_water_sensor` | No | `sensor.heatpump_heating_out` | Measured supply-water temperature entity in °C for the air-coil heating interlock. |
 | `heating_min_flow_c` | No | none | Heating flow minimum requested while this zone is active and below target, range `15` to `35`°C. Changes are ramped. |
 | `floor_material` | No | none | `wood` adds 1°C to the default dew-point margin unless a zone margin is explicitly configured. |
 | `cooling_dewpoint_margin` | No | flow default | Zone-specific degrees above indoor dew point required during protected cooling, range `0` to `10`°C. |
@@ -308,6 +310,8 @@ thermozona:
         - switch.ventilation_coil
       zone_type: air_coil
       zone_response: fast
+      air_coil_requested_water_sensor: sensor.thermozona_flow_temperature
+      air_coil_measured_water_sensor: sensor.heat_pump_supply_temperature
 ```
 
 Protected floor/wall zones raise the shared flow target to at least indoor dew point plus their margin. They close when that constraint exceeds 25°C or conflicts with colder air-coil demand. A configured dew-point sensor becoming unavailable also closes protected zones and blocks cooling commands while protected floor circuits remain active. Setting `cooling_dewpoint_protection: false` explicitly excludes a zone from this protection. Without a configured dew-point sensor, no dew-point limit is applied.
@@ -322,7 +326,7 @@ A wall zone can set `heating_min_flow_c: 32.0`, for example. Its minimum contrib
 
 Air-coil heating closes when requested or measured water reaches 27°C, and reopens only once both values are at or below 25°C. Missing or invalid water readings also keep it closed.
 
-The imported implementation currently reads `sensor.thermozona_flow_temperature` and `sensor.heatpump_heating_out` directly. These IDs came from the source Home Assistant installation; making the interlock sensors configurable is a follow-up before a general release.
+Set `air_coil_requested_water_sensor` and `air_coil_measured_water_sensor` on each `air_coil` zone to match your installation. Both entities must report temperatures in °C. The defaults preserve existing configurations: `sensor.thermozona_flow_temperature` for requested water temperature and `sensor.heatpump_heating_out` for measured water temperature. An unavailable configured sensor keeps air-coil heating closed; the interlock does not apply during cooling.
 
 ## Zone Control Modes
 

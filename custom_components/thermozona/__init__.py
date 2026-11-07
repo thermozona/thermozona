@@ -67,6 +67,8 @@ CONF_ZONE_FLOW_WEIGHT = "zone_flow_weight"
 CONF_ZONE_HEATING_MIN_FLOW = "heating_min_flow_c"
 CONF_ZONE_SOLAR_WEIGHT = "zone_solar_weight"
 CONF_ZONE_TYPE = "zone_type"
+CONF_AIR_COIL_REQUESTED_WATER_SENSOR = "air_coil_requested_water_sensor"
+CONF_AIR_COIL_MEASURED_WATER_SENSOR = "air_coil_measured_water_sensor"
 CONF_FLOOR_MATERIAL = "floor_material"
 CONF_COOLING_DEWPOINT_MARGIN = "cooling_dewpoint_margin"
 CONF_COOLING_DEWPOINT_PROTECTION = "cooling_dewpoint_protection"
@@ -119,6 +121,8 @@ DEFAULT_COOLING_AIR_COIL_ONLY_OFFSET = 0.0
 DEFAULT_ZONE_RESPONSE = ZONE_RESPONSE_SLOW
 DEFAULT_ZONE_FLOW_WEIGHT = 1.0
 DEFAULT_ZONE_SOLAR_WEIGHT = 1.0
+DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR = "sensor.thermozona_flow_temperature"
+DEFAULT_AIR_COIL_MEASURED_WATER_SENSOR = "sensor.heatpump_heating_out"
 CONF_HYSTERESIS = "hysteresis"
 
 DEFAULT_CONTROL_MODE = CONTROL_MODE_BANG_BANG
@@ -273,6 +277,14 @@ ZONE_SCHEMA = vol.Schema(
             CONF_ZONE_TYPE,
             default=ZONE_TYPE_FLOOR,
         ): vol.In([ZONE_TYPE_FLOOR, ZONE_TYPE_WALL, ZONE_TYPE_AIR_COIL]),
+        vol.Optional(
+            CONF_AIR_COIL_REQUESTED_WATER_SENSOR,
+            default=DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR,
+        ): cv.entity_id,
+        vol.Optional(
+            CONF_AIR_COIL_MEASURED_WATER_SENSOR,
+            default=DEFAULT_AIR_COIL_MEASURED_WATER_SENSOR,
+        ): cv.entity_id,
         vol.Optional(CONF_FLOOR_MATERIAL): cv.string,
         vol.Optional(CONF_COOLING_DEWPOINT_MARGIN): vol.All(
             vol.Coerce(float),

@@ -91,6 +91,9 @@ thermozona:
       # floor_material: wood
       # cooling_dewpoint_margin: 2.0
       # cooling_dewpoint_protection: true
+      # For an air-coil zone, use zone_type: air_coil and set its water sensors:
+      # air_coil_requested_water_sensor: sensor.thermozona_flow_temperature
+      # air_coil_measured_water_sensor: sensor.heat_pump_supply_temperature
 
     keuken:
       circuits:

@@ -133,6 +133,8 @@ def test_schema_accepts_zone_and_cooling_options():
         floor_material="wood",
         cooling_dewpoint_margin=3.0,
         cooling_dewpoint_protection=False,
+        air_coil_requested_water_sensor="sensor.requested_water",
+        air_coil_measured_water_sensor="sensor.measured_water",
     )
 
     validated = thermozona.CONFIG_SCHEMA({"thermozona": config})["thermozona"]
@@ -142,6 +144,22 @@ def test_schema_accepts_zone_and_cooling_options():
     assert validated["auto_heat_lockout_above_c"] == 18.0
     assert validated["auto_cool_lockout_below_c"] == 20.0
     assert validated["auto_min_changeover_minutes"] == 30
+    assert (
+        validated["zones"]["living_room"]["air_coil_requested_water_sensor"]
+        == "sensor.requested_water"
+    )
+    assert (
+        validated["zones"]["living_room"]["air_coil_measured_water_sensor"]
+        == "sensor.measured_water"
+    )
+
+
+def test_default_air_coil_sensors_preserve_existing_configuration():
+    validated = thermozona.CONFIG_SCHEMA({"thermozona": _config()})["thermozona"]
+    zone = validated["zones"]["living_room"]
+
+    assert zone["air_coil_requested_water_sensor"] == "sensor.thermozona_flow_temperature"
+    assert zone["air_coil_measured_water_sensor"] == "sensor.heatpump_heating_out"
 
 
 @pytest.mark.parametrize(
@@ -1231,6 +1249,59 @@ async def test_air_coil_heating_reopens_only_after_water_cools(fake_hass):
         fake_hass.states.set("sensor.heatpump_heating_out", str(water))
         await thermostat.async_set_temperature(**{ATTR_TEMPERATURE: 21})
         assert fake_hass.states.get("switch.zone_1").state == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "room_temperature", "water_temperature", "expected"),
+    [
+        ("heat", "19", "24", "on"),
+        ("heat", "19", "27", "off"),
+        ("heat", "19", "unavailable", "off"),
+        ("cool", "24", "27", "on"),
+    ],
+)
+async def test_air_coil_platform_uses_configured_water_sensors(
+    fake_hass, mode, room_temperature, water_temperature, expected
+):
+    from custom_components.thermozona import climate
+
+    config = _config(heat_pump_mode="sensor.mode")
+    config["zones"]["living_room"].update(
+        zone_type="air_coil",
+        air_coil_requested_water_sensor="sensor.custom_requested",
+        air_coil_measured_water_sensor="sensor.custom_measured",
+    )
+    config = thermozona.CONFIG_SCHEMA({"thermozona": config})["thermozona"]
+    controller = HeatPumpController(fake_hass, config)
+    fake_hass.data["thermozona"] = {
+        "entry-1": config,
+        "controllers": {"entry-1": controller},
+    }
+    entities = []
+    await climate.async_setup_entry(
+        fake_hass, SimpleNamespace(entry_id="entry-1"), entities.extend
+    )
+    thermostat = entities[0]
+    fake_hass.states.set("sensor.mode", mode)
+    fake_hass.states.set("sensor.outside", "10" if mode == "heat" else "30")
+    fake_hass.states.set("sensor.living", room_temperature)
+    fake_hass.states.set("switch.zone_1", "off")
+    fake_hass.states.set("sensor.thermozona_flow_temperature", "100")
+    fake_hass.states.set("sensor.heatpump_heating_out", "100")
+    fake_hass.states.set("sensor.custom_requested", "24")
+    fake_hass.states.set("sensor.custom_measured", water_temperature)
+
+    await thermostat.async_set_temperature(**{ATTR_TEMPERATURE: 21})
+
+    assert fake_hass.states.get("switch.zone_1").state == expected
+    expected_action = (
+        HVACAction.HEATING if mode == "heat" else HVACAction.COOLING
+    )
+    if expected == "off":
+        expected_action = HVACAction.IDLE
+    assert thermostat._attr_hvac_action == expected_action
+    await controller.async_shutdown()
 
 
 @pytest.mark.asyncio

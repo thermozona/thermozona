@@ -6,6 +6,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import (
+    CONF_AIR_COIL_MEASURED_WATER_SENSOR,
+    CONF_AIR_COIL_REQUESTED_WATER_SENSOR,
     CONF_CONTROL_MODE,
     CONF_HYSTERESIS,
     CONF_PWM_ACTUATOR_DELAY,
@@ -80,6 +82,12 @@ async def async_setup_entry(
                 config.get(CONF_COOLING_DEWPOINT_MARGIN),
                 config.get(CONF_COOLING_DEWPOINT_PROTECTION),
                 config.get(CONF_ZONE_HEATING_MIN_FLOW),
+                air_coil_requested_water_sensor=config.get(
+                    CONF_AIR_COIL_REQUESTED_WATER_SENSOR
+                ),
+                air_coil_measured_water_sensor=config.get(
+                    CONF_AIR_COIL_MEASURED_WATER_SENSOR
+                ),
             )
         )
 

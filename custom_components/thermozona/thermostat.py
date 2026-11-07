@@ -30,6 +30,8 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from . import (
     CONTROL_MODE_BANG_BANG,
     CONTROL_MODE_PWM,
+    DEFAULT_AIR_COIL_MEASURED_WATER_SENSOR,
+    DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR,
     DEFAULT_PWM_ACTUATOR_DELAY,
     DEFAULT_PWM_CYCLE_TIME,
     DEFAULT_PWM_KI,
@@ -95,6 +97,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         cooling_dewpoint_margin: float | None = None,
         cooling_dewpoint_protection: bool | None = None,
         heating_min_flow_c: float | None = None,
+        air_coil_requested_water_sensor: str | None = None,
+        air_coil_measured_water_sensor: str | None = None,
     ) -> None:
         """Initialize the thermostat."""
         self.hass = hass
@@ -155,6 +159,12 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         )
         self._zone_solar_weight = max(0.0, self._zone_solar_weight)
         self._zone_type = (zone_type or "floor").lower()
+        self._air_coil_requested_water_sensor = (
+            air_coil_requested_water_sensor or DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR
+        )
+        self._air_coil_measured_water_sensor = (
+            air_coil_measured_water_sensor or DEFAULT_AIR_COIL_MEASURED_WATER_SENSOR
+        )
         self._floor_material = (floor_material or "").lower() or None
         self._cooling_dewpoint_margin = (
             float(cooling_dewpoint_margin)
@@ -509,8 +519,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             return
 
         if self._zone_type == "air_coil" and effective_mode == HVACMode.HEAT:
-            requested = self._entity_temperature("sensor.thermozona_flow_temperature")
-            measured = self._entity_temperature("sensor.heatpump_heating_out")
+            requested = self._entity_temperature(self._air_coil_requested_water_sensor)
+            measured = self._entity_temperature(self._air_coil_measured_water_sensor)
             suppressed = air_coil_heating_suppressed(
                 requested, measured, self._air_coil_heat_suppressed
             )
