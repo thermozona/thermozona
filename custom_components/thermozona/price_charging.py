@@ -24,6 +24,7 @@ from . import (
     DEFAULT_PRICE_COAST_HOURS,
     DEFAULT_PRICE_MIN_SPREAD,
 )
+from .thermal_planning import estimate_heat_cost
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,6 +46,12 @@ class ChargeWindow:
     end: datetime
     price: float
     following_price: float
+    charge_fraction: float = 1.0
+    charge_heat_cost: float | None = None
+    normal_heat_cost: float | None = None
+    modeled_saving_percent: float | None = None
+    use_time: datetime | None = None
+    target_temperature: float | None = None
 
 
 def parse_prices(response: dict[str, Any], home: str | None = None) -> list[PriceSlot]:
@@ -104,6 +111,7 @@ def choose_charge_window(
     coast_hours: float = DEFAULT_PRICE_COAST_HOURS,
     min_spread: float = DEFAULT_PRICE_MIN_SPREAD,
     excluded_windows: list[tuple[datetime, datetime]] | None = None,
+    thermal_model: dict[str, Any] | None = None,
 ) -> ChargeWindow | None:
     """Choose the cheapest contiguous block ahead of a meaningfully costlier period."""
     horizon = now + timedelta(hours=24)
@@ -118,7 +126,15 @@ def choose_charge_window(
         following = average_price(slots, end, end + timedelta(hours=coast_hours))
         if price is None or following is None or following - price <= min_spread:
             continue
-        if best is None or price < best.price:
+        if thermal_model is not None:
+            cost = estimate_heat_cost(price, following, (charge_hours + coast_hours) / 2, thermal_model)
+            if cost is None:
+                continue
+            candidate = ChargeWindow(start, end, price, following, cost.fraction, cost.charge,
+                                     cost.normal, cost.saving_percent)
+            if best is None or cost.normal - cost.charge > best.normal_heat_cost - best.charge_heat_cost:
+                best = candidate
+        elif best is None or price < best.price:
             best = ChargeWindow(start, end, price, following)
     return best
 
@@ -187,7 +203,7 @@ class PriceChargingManager:
             return 0.0
         if self.planned_state(datetime.now(timezone.utc)) != "charging":
             return 0.0
-        return float(self._config.get(CONF_PRICE_BOOST, DEFAULT_PRICE_BOOST))
+        return float(self._config.get(CONF_PRICE_BOOST, DEFAULT_PRICE_BOOST)) * self.window.charge_fraction
 
     @property
     def attributes(self) -> dict[str, Any]:
@@ -198,6 +214,13 @@ class PriceChargingManager:
             "planned_state": self.planned_state(datetime.now(timezone.utc)),
             "boost_c": self.boost,
             "configured_boost_c": self._config.get(CONF_PRICE_BOOST, DEFAULT_PRICE_BOOST),
+            "planned_boost_c": (0.0 if window is None else round(
+                float(self._config.get(CONF_PRICE_BOOST, DEFAULT_PRICE_BOOST)) * window.charge_fraction, 2
+            )),
+            "thermal_model": self._config.get("thermal_model"),
+            "estimated_charge_heat_cost": None if window is None else window.charge_heat_cost,
+            "estimated_normal_heat_cost": None if window is None else window.normal_heat_cost,
+            "modeled_saving_percent": None if window is None else window.modeled_saving_percent,
             "charge_start": None if window is None else window.start.isoformat(),
             "charge_end": None if window is None else window.end.isoformat(),
             "average_charge_price": None if window is None else round(window.price, 6),
@@ -307,5 +330,6 @@ class PriceChargingManager:
                         min_spread=float(self._config.get(
                             CONF_PRICE_MIN_SPREAD, DEFAULT_PRICE_MIN_SPREAD
                         )),
+                        thermal_model=self._config.get("thermal_model"),
                     )
             self._notify()

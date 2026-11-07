@@ -74,6 +74,11 @@ thermozona:
   #   charge_hours: 3
   #   coast_hours: 6
   #   min_price_spread: 0.03
+  #   thermal_model:
+  #     normal_cop: 5.0
+  #     charge_cop: 4.5
+  #     loss_percent_per_hour: 1.0
+  #     min_saving_percent: 5
 
   # Optional flow calculation tuning.
   # Keep it small here; see README for the full tuning matrix.
@@ -104,6 +109,8 @@ thermozona:
       # cooling_dewpoint_margin: 2.0
       # cooling_dewpoint_protection: true
       # price_charging: true
+      # setback_schedule: schedule.office_away
+      # setback_c: 1.0
       # For an air-coil zone, use zone_type: air_coil and set its water sensors:
       # air_coil_requested_water_sensor: sensor.thermozona_flow_temperature
       # air_coil_measured_water_sensor: sensor.heat_pump_supply_temperature

@@ -539,6 +539,7 @@ class HeatPumpController:
         *,
         target: float | None,
         current: float | None,
+        cooling_target: float | None = None,
         active: bool | None = None,
         duty_cycle: float | None = None,
         zone_response: str | None = None,
@@ -572,6 +573,9 @@ class HeatPumpController:
         else:
             entry = self._zone_status.setdefault(zone_name, {})
             entry["target"] = float(target)
+            entry["cooling_target"] = max(
+                float(target), float(target if cooling_target is None else cooling_target)
+            )
             entry["current"] = float(current)
             if active is not None:
                 entry["active"] = bool(active)
@@ -652,7 +656,15 @@ class HeatPumpController:
 
         weighted_deltas: list[tuple[float, float]] = []
         for status in self._zone_status.values():
-            delta = float(status["current"]) - float(status["target"])
+            current = float(status["current"])
+            heat_target = float(status["target"])
+            cool_target = float(status.get("cooling_target", heat_target))
+            if current < heat_target:
+                delta = current - heat_target
+            elif current > cool_target:
+                delta = current - cool_target
+            else:
+                continue
             if abs(delta) <= 0.2:
                 continue
             weight = max(0.1, float(status.get("zone_flow_weight", 1.0)))

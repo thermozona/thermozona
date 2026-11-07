@@ -1,7 +1,7 @@
 {
   "domain": "thermozona",
   "name": "Thermozona",
-  "after_dependencies": ["tibber"],
+  "after_dependencies": ["recorder", "tibber"],
   "codeowners": [
     "@japetheape"
   ],

@@ -100,6 +100,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         air_coil_requested_water_sensor: str | None = None,
         air_coil_measured_water_sensor: str | None = None,
         price_charging: bool = False,
+        setback_schedule: str | None = None,
+        setback_c: float = 1.0,
     ) -> None:
         """Initialize the thermostat."""
         self.hass = hass
@@ -162,6 +164,9 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         self._zone_type = (zone_type or "floor").lower()
         self._price_charging_enabled = price_charging
         self._last_price_boost = 0.0
+        self._setback_schedule = setback_schedule
+        self._setback_c = setback_c
+        self._last_setback = 0.0
         self._air_coil_requested_water_sensor = (
             air_coil_requested_water_sensor or DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR
         )
@@ -197,7 +202,9 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             if ATTR_TEMPERATURE in last_state.attributes:
                 try:
                     self._attr_target_temperature = float(
-                        last_state.attributes[ATTR_TEMPERATURE]
+                        last_state.attributes.get(
+                            "comfort_temperature", last_state.attributes[ATTR_TEMPERATURE]
+                        )
                     )
                 except (TypeError, ValueError):
                     _LOGGER.warning(
@@ -307,6 +314,10 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         """Return extra diagnostic state attributes."""
         return {
             "control_mode": self._control_mode,
+            "comfort_temperature": self._attr_target_temperature,
+            "setback_schedule": self._setback_schedule,
+            "setback_active": self.schedule_setback > 0,
+            "scheduled_target_temperature": self.target_temperature,
             "pwm_duty_cycle": round(self._pwm_duty_cycle, 2),
             "pwm_on_time": round(self._pwm_on_time.total_seconds() / 60, 2),
             "pwm_cycle_time": self._pwm_cycle_time_minutes,
@@ -337,19 +348,42 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             return
 
         previous = self._attr_target_temperature
-        self._attr_target_temperature = float(temperature)
+        self._attr_target_temperature = min(
+            self._attr_max_temp, float(temperature) + self.schedule_setback
+        )
         if abs(self._attr_target_temperature - previous) > PWM_TARGET_RESET_DELTA:
             self._reset_pwm_state(reset_integral=True)
 
         await self._control_heating()
 
     @property
+    def schedule_setback(self) -> float:
+        """Lower heating comfort only while the configured absence schedule is on."""
+        if not self._setback_schedule or self._manual_mode == HVACMode.OFF:
+            return 0.0
+        mode = self._controller.get_operation_mode()
+        if mode == "cool" or (
+            mode == "auto" and self._controller._last_auto_effective_mode == HVACMode.COOL
+        ):
+            return 0.0
+        schedule = self.hass.states.get(self._setback_schedule)
+        return self._setback_c if schedule is not None and schedule.state == "on" else 0.0
+
+    @property
+    def target_temperature(self) -> float:
+        """Display the scheduled comfort target, retaining the underlying setting."""
+        return max(self._attr_min_temp, self._attr_target_temperature - self.schedule_setback)
+
+    @property
     def price_charging_boost(self) -> float:
         """Return additional headroom for an opted-in, enabled floor zone."""
+        schedule = self.hass.states.get(self._setback_schedule) if self._setback_schedule else None
         if (
             not self._price_charging_enabled
             or self._zone_type != "floor"
             or self._manual_mode == HVACMode.OFF
+            or self.schedule_setback > 0
+            or (self._setback_schedule is not None and (schedule is None or schedule.state not in {"on", "off"}))
         ):
             return 0.0
         boost = self._controller.get_price_charging_boost()
@@ -358,7 +392,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
     @property
     def effective_target_temperature(self) -> float:
         """Apply temporary headroom without changing the saved comfort target."""
-        return self._attr_target_temperature + self.price_charging_boost
+        return self.target_temperature + self.price_charging_boost
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set HVAC mode."""
@@ -389,6 +423,10 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
 
     async def _control_heating(self) -> None:
         """Control the heating based on configured strategy."""
+        setback = self.schedule_setback
+        if setback != self._last_setback:
+            self._last_setback = setback
+            self._reset_pwm_state(reset_integral=True)
         previous_boost = self._last_price_boost
         self._last_price_boost = self.price_charging_boost
         if self._last_price_boost != previous_boost:
@@ -417,6 +455,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
                 self._controller.update_zone_status(
                     self._zone_name,
                     target=self.effective_target_temperature,
+                    cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
                     current=self._attr_target_temperature,
                     active=True,
                     duty_cycle=0.0,
@@ -439,6 +478,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         self._controller.update_zone_status(
             self._zone_name,
             target=self.effective_target_temperature,
+            cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
             current=current_temp,
             active=active_before,
             duty_cycle=self._current_zone_duty_hint(active_before),
@@ -465,6 +505,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             self._controller.update_zone_status(
                 self._zone_name,
                 target=self.effective_target_temperature,
+                cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
                 current=current_temp,
                 active=False,
                 duty_cycle=0.0,
@@ -490,6 +531,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             self._controller.update_zone_status(
                 self._zone_name,
                 target=self.effective_target_temperature,
+                cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
                 current=current_temp,
                 active=False,
                 duty_cycle=0.0,
@@ -526,6 +568,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             self._controller.update_zone_status(
                 self._zone_name,
                 target=self.effective_target_temperature,
+                cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
                 current=current_temp,
                 active=not circuits_closed,
                 duty_cycle=0.0 if circuits_closed else 100.0,
@@ -584,6 +627,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         self._controller.update_zone_status(
             self._zone_name,
             target=self.effective_target_temperature,
+            cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
             current=current_temp,
             active=active_after,
             duty_cycle=self._current_zone_duty_hint(active_after),
@@ -810,10 +854,11 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             self._remove_temp_sensor_listener()
             self._remove_temp_sensor_listener = None
 
-        if self._temp_sensor is not None:
+        entities = [entity for entity in [self._temp_sensor, self._setback_schedule] if entity]
+        if entities:
             self._remove_temp_sensor_listener = async_track_state_change_event(
                 self.hass,
-                self._temp_sensor,
+                entities[0] if len(entities) == 1 else entities,
                 self._handle_temp_sensor_change,
             )
 

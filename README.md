@@ -207,6 +207,8 @@ thermozona:
 | `circuits` | Yes | none | List of switch-like entities controlled by the zone. |
 | `hysteresis` | No | `0.3` | Deadband around the target temperature for `bang_bang` mode. |
 | `control_mode` | No | `bang_bang` | `bang_bang` or `pwm`. |
+| `setback_schedule` | No | none | Schedule/helper entity: while on, lower this zone's heating comfort target. Create a UI Schedule helper to edit days and times in Home Assistant. |
+| `setback_c` | No | `1.0` | Scheduled heating reduction in °C, range `0` to `5`. Extra price charging pauses for this zone during setback. |
 | `pwm_cycle_time` | No | `15` | PWM cycle length in minutes, range `5` to `30`. |
 | `pwm_min_on_time` | No | `3` | Minimum PWM on time in minutes, range `1` to `10`. |
 | `pwm_min_off_time` | No | `3` | Minimum PWM off time in minutes, range `1` to `10`. |
@@ -408,6 +410,23 @@ thermozona:
       pwm_actuator_delay: 3
 ```
 
+## Editable work schedule
+
+Create a **Schedule** helper in Settings → Devices & services → Helpers and mark the periods when the room should be cooler. Use a UI-managed helper so its days and times remain editable in Home Assistant:
+
+```yaml
+thermozona:
+  zones:
+    office:
+      temp_sensor: sensor.office_temperature
+      circuits:
+        - switch.office_heating
+      setback_schedule: schedule.office_away
+      setback_c: 1.0
+```
+
+With a normal target of 20°C, an active schedule displays and controls 19°C. When the schedule ends it returns to 20°C. A manual temperature adjustment during setback adjusts the underlying comfort setting by the same amount. The comfort setting is retained over restarts. The schedule does not activate zones that are off or lower cooling targets. Missing schedule data retains normal comfort and suspends extra price charging in the affected zone.
+
 ## Reloading YAML
 
 After changing `configuration.yaml`, use one of these options:
@@ -508,3 +527,51 @@ The request entity must connect to your installation's existing protected start/
 `sensor.thermozona_hot_water` exposes temperature, SOC, request ownership, the selected window, and errors. This first implementation uses the timing and thresholds above; it does not replace native hygiene cycles or calculate stored energy from temperature.
 
 Hot-water demand takes priority over the shared compressor. Configure `active_sensors` with the heat pump’s native DHW and bus-demand signals. CV demand and temporary house-charging headroom pause while a boiler request or native cycle is active, including the minimum-runtime stop delay. Unknown configured activity signals also suspend CV demand. The house planner excludes the reserved boiler window plus 15 minutes; normal room targets remain unchanged.
+
+### Heat cost and learned hot-water use
+
+An optional `thermal_model` on `price_charging` compares estimated cost per useful kWh of heat after COP and storage loss. A minimum modeled saving is required, and the temporary temperature boost scales with that advantage up to the configured maximum. Negative prices never make extra thermal loss appear beneficial. COP and loss settings are explicit estimates, not measurements or guaranteed savings.
+
+Optional `hot_water.smart_charging` learns recurring rapid tank-temperature drops through Home Assistant recorder history. It requires at least three observed days and a draw recurring on at least three days and 40% of observed days. Slow standby cooling, unavailable readings, long gaps and isolated sensor jumps do not establish usage. The profile is refreshed every six hours. Temperature drops are a demand proxy; no tank volume or liters of usable hot water are inferred.
+
+```yaml
+thermozona:
+  price_charging:
+    mode: preview
+    boost_c: 0.5
+    thermal_model:
+      normal_cop: 5.0
+      charge_cop: 4.5
+      loss_percent_per_hour: 1.0
+      min_saving_percent: 5
+      full_charge_saving_percent: 25
+  hot_water:
+    # Include the gateway and sensor options from the example above.
+    smart_charging:
+      target_entity: input_number.hot_water_charge_target
+      normal_temperature: 50
+      max_temperature: 55
+      min_boost_c: 2
+      history_days: 7
+      min_days: 3
+      max_storage_hours: 12
+      min_price_spread: 0.03
+      thermal_model:
+        normal_cop: 3.0
+        charge_cop: 2.5
+        loss_percent_per_hour: 0.5
+        min_saving_percent: 5
+        full_charge_saving_percent: 25
+```
+
+**The protected gateway must consume `target_entity` instead of a hardcoded boost temperature.** Thermozona sets it before requesting heat. Match the helper's bounds and the gateway's temperature clamp to the configured limits. The gateway still enforces startup stability, minimum runtime, cooldown, and restoration to the native normal target.
+
+For an Ecoforest gateway using register 134 in tenths of a degree, the bounded value expression for the example above is:
+
+```yaml
+value: "{{ (([55, [50, states('input_number.hot_water_charge_target') | float(50)] | max] | min) * 10) | round(0) | int }}"
+```
+
+If a periodic trigger retries startup, apply the stability duration to the demand **condition** as well as the state trigger, so retries cannot bypass it. Smart charging uses actual temperature and learned demand; the legacy SOC proxy remains diagnostic and is not required for its decisions.
+
+Price-driven extra heating is planned to finish at least 15 minutes before learned use and only when modeled cheaper than normal heating at that time. The extra target is limited by the observed temperature-drop proxy, configured maximum, and price advantage; charging stops at that target. A minimum extra target of 2°C avoids planning tiny boosts. Solar surplus can use the configured maximum before a learned upcoming draw. With insufficient/unavailable history or no economical window, additional charging is skipped while native hot-water comfort continues. Hygiene cycles remain controlled by the heat pump. Diagnostics expose the learned periods, observation days, estimated heat costs, modeled advantage and target temperature. The instantaneous COP sensor is not used as a measured calibration.

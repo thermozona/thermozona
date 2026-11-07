@@ -10,7 +10,10 @@ from typing import Any
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.event import async_track_state_change_event
 
-from .price_charging import ChargeWindow, PriceChargingManager, average_price
+from .price_charging import ChargeWindow, PriceChargingManager, PriceSlot, average_price
+from .thermal_planning import (
+    UsageProfile, async_temperature_history, estimate_heat_cost, infer_usage_profile,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,6 +31,71 @@ class HotWaterManager(PriceChargingManager):
         self._surplus_since = None
         self._import_since = None
         self._remove_state_listener = None
+        self._smart = config.get("smart_charging")
+        self._usage = UsageProfile()
+        self._usage_updated: datetime | None = None
+        self._history_attempt: datetime | None = None
+        self._usage_error = None
+        self._active_target: float | None = None
+
+    @property
+    def _time_zone(self) -> str:
+        return getattr(getattr(self._hass, "config", None), "time_zone", "UTC")
+
+    async def _refresh_usage(self, now: datetime) -> None:
+        """Learn recurring draws at most every six hours, retrying failures hourly."""
+        if self._smart is None:
+            return
+        if self._usage_updated is not None and now - self._usage_updated < timedelta(hours=6):
+            return
+        if self._history_attempt is not None and now - self._history_attempt < timedelta(hours=1):
+            return
+        self._history_attempt = now
+        try:
+            samples = await async_temperature_history(
+                self._hass, self._config["temperature_sensor"], now,
+                self._smart.get("history_days", 7),
+            )
+            self._usage = infer_usage_profile(samples, self._time_zone,
+                min_days=self._smart.get("min_days", 3))
+            self._usage_updated = now
+            self._usage_error = None
+        except Exception as err:
+            self._usage = UsageProfile()
+            self._usage_error = "usage_history_unavailable"
+            _LOGGER.warning("Hot-water usage history unavailable (%s)", type(err).__name__)
+
+    def _smart_window(self, slots: list[PriceSlot], now: datetime) -> ChargeWindow | None:
+        """Plan limited extra heat before a learned draw only when modeled useful heat is cheaper."""
+        best = None
+        normal = self._smart.get("normal_temperature", 50.0)
+        maximum = self._smart.get("max_temperature", 55.0)
+        for use_time, period in self._usage.upcoming(now, self._time_zone):
+            normal_price = average_price(slots, use_time, use_time + timedelta(hours=1))
+            if normal_price is None:
+                continue
+            for start in [now, *(s.start for s in slots if now < s.start < use_time)]:
+                end = start + timedelta(hours=1)
+                if end > use_time - timedelta(minutes=15):
+                    continue
+                if use_time - end > timedelta(hours=self._smart.get("max_storage_hours", 12)):
+                    continue
+                price = average_price(slots, start, end)
+                if price is None or normal_price - price <= self._smart.get("min_price_spread", 0.03):
+                    continue
+                hours = (use_time - (start + timedelta(minutes=30))).total_seconds() / 3600
+                cost = estimate_heat_cost(price, normal_price, hours, self._smart["thermal_model"])
+                if cost is None:
+                    continue
+                extra = min(maximum - normal, period.drop_c) * cost.fraction
+                target = min(maximum, normal + round(extra * 2) / 2)
+                if target < normal + self._smart.get("min_boost_c", 2.0):
+                    continue
+                candidate = ChargeWindow(start, end, price, normal_price, cost.fraction,
+                    cost.charge, cost.normal, cost.saving_percent, use_time, target)
+                if best is None or cost.normal - cost.charge > best.normal_heat_cost - best.charge_heat_cost:
+                    best = candidate
+        return best
 
     @property
     def blocks_space_heating(self) -> bool:
@@ -51,7 +119,7 @@ class HotWaterManager(PriceChargingManager):
         """React immediately to native heat-pump and request state changes."""
         self._remove_state_listener = async_track_state_change_event(
             self._hass,
-            [self._config["demand_entity"], *self._config.get("active_sensors", [])],
+            [self._config["demand_entity"], self._config["temperature_sensor"], *self._config.get("active_sensors", [])],
             self._async_demand_changed,
         )
         await super().async_start()
@@ -94,6 +162,21 @@ class HotWaterManager(PriceChargingManager):
             "charge_start": None if self.window is None else self.window.start.isoformat(),
             "charge_end": None if self.window is None else self.window.end.isoformat(),
             "average_price": None if self.window is None else self.window.price,
+            "target_temperature": self._active_target if self._owned else (
+                None if self.window is None else self.window.target_temperature
+            ),
+            "expected_use": None if self.window is None or self.window.use_time is None else self.window.use_time.isoformat(),
+            "usage_periods": [{"time": f"{p.minute // 60:02}:{p.minute % 60:02}",
+                               "temperature_drop_c": round(p.drop_c, 1), "days": p.days}
+                              for p in self._usage.periods],
+            "usage_observed_days": self._usage.observed_days,
+            "usage_draws": self._usage.draws,
+            "usage_updated_at": None if self._usage_updated is None else self._usage_updated.isoformat(),
+            "usage_error": self._usage_error,
+            "thermal_model": None if self._smart is None else self._smart["thermal_model"],
+            "modeled_saving_percent": None if self.window is None else self.window.modeled_saving_percent,
+            "estimated_charge_heat_cost": None if self.window is None else self.window.charge_heat_cost,
+            "estimated_normal_heat_cost": None if self.window is None else self.window.normal_heat_cost,
             "error": self.error,
         }
 
@@ -117,6 +200,7 @@ class HotWaterManager(PriceChargingManager):
             blocking=True,
         )
         self._owned = False
+        self._active_target = None
 
     async def async_set_mode(self, mode: str) -> None:
         if mode not in {"off", "monitor", "auto"}:
@@ -146,7 +230,14 @@ class HotWaterManager(PriceChargingManager):
                     return
                 await self._prices.async_refresh()
                 slots = self._prices._slots
-                if not self._owned and (self.window is None or now >= self.window.end):
+                await self._refresh_usage(now)
+                if self._stopped or self.mode == "off":
+                    self._reason = "off"
+                    self._notify()
+                    return
+                if self._smart is not None and not self._owned:
+                    self.window = self._smart_window(slots, now)
+                elif not self._owned and (self.window is None or now >= self.window.end):
                     candidates = []
                     for start in [now, *(s.start for s in slots if now < s.start < now + timedelta(days=1))]:
                         end = start + timedelta(hours=1)
@@ -158,13 +249,21 @@ class HotWaterManager(PriceChargingManager):
                 soc = self._number("soc_sensor")
                 demand = self._state("demand_entity")
                 source = self._state("source_entity")
-                valid = temperature is not None and soc is not None and 0 <= soc <= 100
+                valid = temperature is not None and (
+                    self._smart is not None or (soc is not None and 0 <= soc <= 100)
+                )
                 in_window = self.window is not None and self.window.start <= now < self.window.end
                 runtime = self._elapsed("started_at_entity", now)
                 if (self.mode == "auto" and source is not None
                         and source.state in {"price", "solar"}
                         and demand is not None and demand.state == "on"):
                     self._owned = True
+                    if self._smart is not None and self._active_target is None:
+                        state = self._hass.states.get(self._smart["target_entity"])
+                        try:
+                            self._active_target = float(state.state)
+                        except (AttributeError, ValueError, TypeError):
+                            self._active_target = None
                 if self._requested_at is not None and (
                     runtime is None or runtime > (now-self._requested_at).total_seconds()+60
                 ):
@@ -186,7 +285,11 @@ class HotWaterManager(PriceChargingManager):
                     expired = not in_window or not slots
                     if is_solar:
                         expired = self._import_since is not None and (now-self._import_since).total_seconds() >= (60 if grid is None else 300)
-                    stop = (demand is None or demand.state != "on" or not valid or soc >= 99 or temperature >= 65 or
+                    target = self._active_target if self._smart is not None else 65
+                    target_valid = target is not None and math.isfinite(target) and (
+                        self._smart is None or self._smart.get("normal_temperature", 50) <= target <= self._smart.get("max_temperature", 55)
+                    )
+                    stop = (demand is None or demand.state != "on" or not valid or not target_valid or (soc is not None and soc >= 99) or (temperature is not None and target_valid and temperature >= target) or
                             expired or
                             runtime is None or runtime >= 5400)
                     if stop:
@@ -200,7 +303,31 @@ class HotWaterManager(PriceChargingManager):
                     self._reason = "external_control"
                 else:
                     elapsed = self._elapsed("last_off_entity", now)
-                    if ((solar and soc < 99) or (in_window and soc < 40)) and elapsed is not None and elapsed > 14400:
+                    target = None if self.window is None else self.window.target_temperature
+                    if self._smart is not None:
+                        if solar and self._usage.periods and self._usage.upcoming(now, self._time_zone):
+                            next_use, period = self._usage.upcoming(now, self._time_zone)[0]
+                            if next_use - now <= timedelta(hours=self._smart.get("max_storage_hours", 12)):
+                                target = min(self._smart.get("max_temperature", 55),
+                                    self._smart.get("normal_temperature", 50) + period.drop_c)
+                        native_idle = all(
+                            (state := self._hass.states.get(e)) is not None and state.state in {"off", "0", "0.0"}
+                            for e in self._config.get("active_sensors", [])
+                        )
+                        should_start = native_idle and target is not None and temperature < target - 0.5 and (solar or in_window)
+                    else:
+                        should_start = (solar and soc < 99) or (in_window and soc < 40)
+                    if should_start and elapsed is not None and elapsed > 14400:
+                        if self._smart is not None:
+                            entity = self._smart["target_entity"]
+                            state = self._hass.states.get(entity)
+                            if state is None or state.state in {"unknown", "unavailable"}:
+                                self._reason = "unavailable"
+                                self._notify()
+                                return
+                            await self._hass.services.async_call(entity.split(".")[0], "set_value",
+                                {"entity_id": entity, "value": target}, blocking=True)
+                            self._active_target = target
                         await self._hass.services.async_call(
                             "input_select", "select_option",
                             {"entity_id": self._config["source_entity"], "option": "solar" if solar else "price"}, blocking=True,
@@ -210,7 +337,10 @@ class HotWaterManager(PriceChargingManager):
                         await self._gateway(True)
                         self._reason = "requested"
                     else:
-                        self._reason = "scheduled" if self.window is not None else "unavailable"
+                        self._reason = "scheduled" if self.window is not None else (
+                            "learning_usage" if self._smart is not None and not self._usage.periods else
+                            "no_economic_window" if self._smart is not None else "unavailable"
+                        )
                 self.error = self._prices.error
             except Exception as err:
                 self.error = "gateway_or_data_error"

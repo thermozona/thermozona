@@ -13,6 +13,7 @@ class ThermozonaControlCard extends HTMLElement {
     this._hass = hass;
     const entities = Object.entries(hass.states).filter(([id]) =>
       id.includes("thermozona") || id === "sensor.elektriciteitsprijs_actief" ||
+      id === "schedule.werkkamer_buitenshuis" ||
       id === "binary_sensor.ventilation_floor_condensation_risk"
     );
     if (entities.length !== this._previous?.size ||
@@ -66,9 +67,15 @@ class ThermozonaControlCard extends HTMLElement {
     let detail;
     if (!this._available(select) || !this._available(sensor)) detail = "Gegevens ontbreken";
     else if (mode === "off") detail = "Uit · normaal comfort blijft actief";
-    else detail = `${mode === "auto" ? "" : "Alleen bekijken · "}${this._window(attrs)}`;
+    else {
+      const phase = this._value(sensor);
+      const plan = phase === "learning_usage" ? "Leert je warmwatergebruik" :
+        !attrs.charge_start ? "Geen voordelig laadmoment" : this._window(attrs);
+      const target = boiler && attrs.target_temperature != null ? ` · tot ${this._number(attrs.target_temperature)} °C` : "";
+      detail = `${mode === "auto" ? "" : "Alleen bekijken · "}${plan}${target}`;
+    }
     const extra = boiler ? `${this._number(attrs.temperature)} °C` :
-      mode === "off" ? "" : `+${this._number(attrs.configured_boost_c ?? 0.5)} °C`;
+      mode === "off" ? "" : `+${this._number(attrs.planned_boost_c ?? attrs.configured_boost_c ?? 0.5)} °C`;
     return `<div class="charge-row">
       <ha-icon class="row-icon" icon="${icon}"></ha-icon>
       <div class="row-text"><div class="row-title">${label}<span class="row-value">${this._escape(extra)}</span></div>
@@ -77,6 +84,15 @@ class ThermozonaControlCard extends HTMLElement {
         aria-label="${label} automatisch" data-action="toggle" data-entity="${select}"
         ${this._pending || !this._available(select) ? "disabled" : ""}><span></span></button>
     </div>`;
+  }
+  _workSchedule() {
+    if (!this._state("schedule.werkkamer_buitenshuis")) return "";
+    const active = this._value("schedule.werkkamer_buitenshuis") === "on";
+    const attrs = this._attrs("climate.thermozona_begane_grond_werkkamer");
+    const target = attrs.scheduled_target_temperature ?? attrs.temperature;
+    return `<button class="work-plan" data-action="work-plan"><ha-icon icon="mdi:calendar-week"></ha-icon>
+      <span>Werkkamer · ${active ? "Buitenshuis" : "Normaal"}${target == null ? "" : ` · ${this._number(target)} °C`}
+      <small>Werkschema aanpassen</small></span><ha-icon icon="mdi:chevron-right"></ha-icon></button>`;
   }
   _alerts() {
     const problems = [
@@ -138,6 +154,9 @@ class ThermozonaControlCard extends HTMLElement {
       .switch{border:0;flex-shrink:0;width:38px;height:23px;padding:3px;border-radius:14px;background:var(--disabled-text-color,#666);margin-left:2px}
       .switch span{display:block;width:17px;height:17px;background:var(--card-background-color,#fff);border-radius:50%}
       .switch.checked{background:var(--primary-color,#03a9f4)}.switch.checked span{transform:translateX(15px)}
+      .work-plan{display:flex;align-items:center;gap:10px;width:100%;text-align:left;border:0;background:none;padding:12px 0;font-size:13px}
+      .work-plan>span{flex:1}.work-plan ha-icon{--mdc-icon-size:20px;color:var(--secondary-text-color)}
+      .work-plan small{display:block;margin-top:4px;font-size:12px;color:var(--secondary-text-color)}
       .alert{display:flex;width:100%;gap:9px;align-items:center;text-align:left;background:none;border:0;padding:10px 0;min-height:52px}
       .alert>ha-icon{color:var(--warning-color,#ffb74d);--mdc-icon-size:21px}.alert>span{flex:1}.alert strong{font-size:13px;font-weight:500}
       .alert-detail{display:block;font-size:12px;line-height:18px;color:var(--secondary-text-color)}.alert .chevron{color:var(--secondary-text-color);--mdc-icon-size:18px}
@@ -153,6 +172,7 @@ class ThermozonaControlCard extends HTMLElement {
         `<button class="mode ${mode === value ? "selected" : ""}" aria-pressed="${mode === value}" data-action="mode" data-option="${value}" ${this._pending || !this._available("select.thermozona_heat_pump_mode") ? "disabled" : ""}>${label}</button>`
       ).join("")}</div>
       <div class="charges">${this._row("house", "Huis laden", "mdi:home-thermometer-outline")}${this._row("boiler", "Boiler laden", "mdi:water-boiler")}</div>
+      ${this._workSchedule()}
       ${this._alerts()}
       <div class="footer"><button class="link" data-action="boiler"><ha-icon icon="mdi:water-boiler"></ha-icon>Boiler bekijken</button>
         <button class="link" data-action="settings"><ha-icon icon="mdi:tune-variant"></ha-icon>Instellingen</button></div>
@@ -167,8 +187,8 @@ class ThermozonaControlCard extends HTMLElement {
       this.dispatchEvent(new CustomEvent("hass-more-info", { bubbles: true, composed: true, detail: { entityId: button.dataset.entity } }));
       return;
     }
-    if (action === "boiler" || action === "settings") {
-      const path = action === "boiler" ? "/dashboard-vloerverwarming/boiler" : "/dashboard-vloerverwarming/detail";
+    if (action === "boiler" || action === "settings" || action === "work-plan") {
+      const path = action === "work-plan" ? "/config/helpers" : action === "boiler" ? "/dashboard-vloerverwarming/boiler" : "/dashboard-vloerverwarming/detail";
       history.pushState(null, "", path);
       window.dispatchEvent(new Event("location-changed"));
       return;

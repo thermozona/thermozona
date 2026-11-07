@@ -11,6 +11,8 @@ from . import (
     CONF_CONTROL_MODE,
     CONF_HYSTERESIS,
     CONF_PRICE_CHARGING,
+    CONF_SETBACK_C,
+    CONF_SETBACK_SCHEDULE,
     CONF_PWM_ACTUATOR_DELAY,
     CONF_PWM_CYCLE_TIME,
     CONF_PWM_KI,
@@ -90,6 +92,8 @@ async def async_setup_entry(
                     CONF_AIR_COIL_MEASURED_WATER_SENSOR
                 ),
                 price_charging=config.get(CONF_PRICE_CHARGING, False),
+                setback_schedule=config.get(CONF_SETBACK_SCHEDULE),
+                setback_c=config.get(CONF_SETBACK_C, 1.0),
             )
         )
 

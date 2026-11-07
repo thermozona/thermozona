@@ -140,6 +140,8 @@ DEFAULT_ZONE_SOLAR_WEIGHT = 1.0
 DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR = "sensor.thermozona_flow_temperature"
 DEFAULT_AIR_COIL_MEASURED_WATER_SENSOR = "sensor.heatpump_heating_out"
 CONF_HYSTERESIS = "hysteresis"
+CONF_SETBACK_SCHEDULE = "setback_schedule"
+CONF_SETBACK_C = "setback_c"
 
 DEFAULT_CONTROL_MODE = CONTROL_MODE_BANG_BANG
 DEFAULT_PWM_CYCLE_TIME = 15
@@ -268,11 +270,23 @@ FLOW_SCHEMA = vol.Schema(
     }
 )
 
+def _finite_float(value: object) -> float:
+    """Reject nonfinite numeric configuration before it reaches control logic."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise vol.Invalid("Value must be finite")
+    return number
+
+
 ZONE_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_CIRCUITS): [cv.entity_id],
         vol.Required(CONF_TEMP_SENSOR): cv.entity_id,
         vol.Optional(CONF_PRICE_CHARGING, default=False): cv.boolean,
+        vol.Optional(CONF_SETBACK_SCHEDULE): cv.entity_id,
+        vol.Optional(CONF_SETBACK_C, default=1.0): vol.All(
+            vol.Coerce(_finite_float), vol.Range(min=0, max=5)
+        ),
         vol.Optional(CONF_HYSTERESIS): vol.All(
             vol.Coerce(float),
             vol.Range(min=0, max=5),
@@ -344,15 +358,41 @@ ZONE_SCHEMA = vol.Schema(
     }
 )
 
-def _finite_float(value: object) -> float:
-    """Reject nonfinite numeric configuration before it reaches control logic."""
-    number = float(value)
-    if not math.isfinite(number):
-        raise vol.Invalid("Value must be finite")
-    return number
+THERMAL_MODEL_SCHEMA = vol.Schema({
+    vol.Required("charge_cop"): vol.All(vol.Coerce(_finite_float), vol.Range(min=1, max=15)),
+    vol.Required("normal_cop"): vol.All(vol.Coerce(_finite_float), vol.Range(min=1, max=15)),
+    vol.Optional("loss_percent_per_hour", default=1.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=0, max=20)),
+    vol.Optional("min_saving_percent", default=5.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=0, max=90)),
+    vol.Optional("full_charge_saving_percent", default=25.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=1, max=100)),
+})
 
+SMART_HOT_WATER_SCHEMA = vol.Schema({
+    vol.Required("target_entity"): cv.entity_id,
+    vol.Required("thermal_model"): THERMAL_MODEL_SCHEMA,
+    vol.Optional("normal_temperature", default=50.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=45, max=65)),
+    vol.Optional("max_temperature", default=55.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=45, max=65)),
+    vol.Optional("min_boost_c", default=2.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=0.5, max=10)),
+    vol.Optional("history_days", default=7): vol.All(vol.Coerce(int), vol.Range(min=3, max=14)),
+    vol.Optional("min_days", default=3): vol.All(vol.Coerce(int), vol.Range(min=3, max=14)),
+    vol.Optional("max_storage_hours", default=12.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=1, max=24)),
+    vol.Optional("min_price_spread", default=0.03): vol.All(vol.Coerce(_finite_float), vol.Range(min=0, max=2)),
+})
+
+
+def _validate_smart_hot_water(config: dict) -> dict:
+    """Reject contradictory limits and unsupported target output domains."""
+    if config["normal_temperature"] > config["max_temperature"]:
+        raise vol.Invalid("max_temperature must be at least normal_temperature")
+    if config["min_boost_c"] > config["max_temperature"] - config["normal_temperature"]:
+        raise vol.Invalid("min_boost_c exceeds available temperature headroom")
+    if config["min_days"] > config["history_days"]:
+        raise vol.Invalid("min_days cannot exceed history_days")
+    if config["target_entity"].split(".")[0] not in {"input_number", "number"}:
+        raise vol.Invalid("target_entity must be a number or input_number")
+    return config
 
 PRICE_CHARGING_SCHEMA = vol.Schema({
+    vol.Optional("thermal_model"): THERMAL_MODEL_SCHEMA,
     vol.Optional(CONF_PRICE_MODE, default="off"): vol.In(["off", "preview", "auto"]),
     vol.Optional(CONF_PRICE_HOME): cv.string,
     vol.Optional(CONF_PRICE_BOOST, default=DEFAULT_PRICE_BOOST): vol.All(
@@ -370,6 +410,7 @@ PRICE_CHARGING_SCHEMA = vol.Schema({
 })
 
 HOT_WATER_SCHEMA = vol.Schema({
+    vol.Optional("smart_charging"): vol.All(SMART_HOT_WATER_SCHEMA, _validate_smart_hot_water),
     **{vol.Required(key): cv.entity_id for key in (
         "temperature_sensor", "soc_sensor", "demand_entity", "source_entity",
         "last_off_entity", "started_at_entity",
