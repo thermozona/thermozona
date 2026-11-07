@@ -27,13 +27,7 @@ async def async_setup_entry(
     domain_data = hass.data[DOMAIN]
     entry_config = domain_data[config_entry.entry_id]
 
-    controllers = domain_data.setdefault("controllers", {})
-    controller = controllers.get(config_entry.entry_id)
-    if controller is None:
-        controller = HeatPumpController(hass, entry_config)
-    else:
-        controller.refresh_entry_config(entry_config)
-    controllers[config_entry.entry_id] = controller
+    controller = domain_data["controllers"][config_entry.entry_id]
 
     async_add_entities(
         [

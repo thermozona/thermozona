@@ -26,13 +26,7 @@ async def async_setup_entry(
     domain_data = hass.data[DOMAIN]
     entry_config = domain_data[config_entry.entry_id]
 
-    controllers = domain_data.setdefault("controllers", {})
-    controller = controllers.get(config_entry.entry_id)
-    if controller is None:
-        controller = HeatPumpController(hass, entry_config)
-    else:
-        controller.refresh_entry_config(entry_config)
-    controllers[config_entry.entry_id] = controller
+    controller = domain_data["controllers"][config_entry.entry_id]
 
     entities: list[NumberEntity] = [
         ThermozonaFlowTemperatureNumber(config_entry.entry_id, controller),
@@ -48,7 +42,7 @@ class ThermozonaFlowTemperatureNumber(NumberEntity):
     _attr_has_entity_name = True
     _attr_name = "Flow Temperature"
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-    _attr_native_min_value = 10.0
+    _attr_native_min_value = 5.0
     _attr_native_max_value = 45.0
     _attr_native_step = 0.5
     _attr_icon = "mdi:thermometer"

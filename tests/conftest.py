@@ -7,6 +7,7 @@ import types
 from enum import Enum, IntFlag
 
 import pytest
+import voluptuous as vol
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -27,6 +28,17 @@ class _BaseEntity:
 class _RestoreEntity:
     async def async_get_last_state(self):
         return None
+
+
+class _RestoreNumber(_BaseEntity, _RestoreEntity):
+    async def async_get_last_number_data(self):
+        return None
+
+
+class _SelectEntity(_BaseEntity):
+    @property
+    def options(self):
+        return self._attr_options
 
 
 class _ClimateEntityFeature(IntFlag):
@@ -187,6 +199,8 @@ def pytest_configure():
     const = types.ModuleType("homeassistant.const")
     const.Platform = _Platform
     const.ATTR_TEMPERATURE = "temperature"
+    const.STATE_UNKNOWN = "unknown"
+    const.STATE_UNAVAILABLE = "unavailable"
     const.UnitOfTemperature = _UnitOfTemperature
 
     exceptions = types.ModuleType("homeassistant.exceptions")
@@ -195,6 +209,7 @@ def pytest_configure():
     cv = types.ModuleType("homeassistant.helpers.config_validation")
     cv.entity_id = str
     cv.string = str
+    cv.boolean = vol.Boolean()
 
     entity_platform = types.ModuleType("homeassistant.helpers.entity_platform")
     entity_platform.AddEntitiesCallback = object
@@ -217,9 +232,10 @@ def pytest_configure():
 
     number = types.ModuleType("homeassistant.components.number")
     number.NumberEntity = _BaseEntity
+    number.RestoreNumber = _RestoreNumber
 
     select = types.ModuleType("homeassistant.components.select")
-    select.SelectEntity = _BaseEntity
+    select.SelectEntity = _SelectEntity
 
     sensor = types.ModuleType("homeassistant.components.sensor")
     sensor.SensorEntity = _BaseEntity

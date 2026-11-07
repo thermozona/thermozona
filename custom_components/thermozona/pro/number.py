@@ -3,14 +3,14 @@
 """Number entities for advanced Thermozona controls."""
 from __future__ import annotations
 
-from homeassistant.components.number import NumberEntity
+from homeassistant.components.number import RestoreNumber
 from homeassistant.const import UnitOfTemperature
 from homeassistant.helpers.entity import EntityCategory
 
 from .. import DOMAIN
 
 
-class ThermozonaFlowCurveOffsetNumber(NumberEntity):
+class ThermozonaFlowCurveOffsetNumber(RestoreNumber):
     """Expose runtime flow-curve offset control as a Home Assistant number."""
 
     _attr_has_entity_name = True
@@ -40,6 +40,13 @@ class ThermozonaFlowCurveOffsetNumber(NumberEntity):
     async def async_added_to_hass(self) -> None:
         """Register with heat pump controller."""
         await super().async_added_to_hass()
+        if (last_data := await self.async_get_last_number_data()) is not None:
+            restored = last_data.native_value
+            if (
+                restored is not None
+                and self._attr_native_min_value <= restored <= self._attr_native_max_value
+            ):
+                self._controller.set_flow_curve_offset(restored)
         self._controller.register_flow_curve_offset_number(self)
 
     async def async_will_remove_from_hass(self) -> None:

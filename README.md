@@ -24,6 +24,7 @@ Learn more at [thermozona.com](https://thermozona.com).
 - Weather-aware flow temperature calculation.
 - Internal helper entities for heat pump status, flow temperature, flow temperature history, and runtime curve offset.
 - Demand-weighted heating flow calculation with slow/fast zone weighting, slew limiting, preheat forecast, and solar forecast compensation.
+- Dew-point-aware floor cooling, air-coil cooling, and per-zone heating flow minimums.
 
 ## Requirements
 
@@ -31,6 +32,7 @@ Learn more at [thermozona.com](https://thermozona.com).
 - One temperature sensor per zone.
 - One or more switch-like entities per zone for valves, relays, actuators, or manifold outputs.
 - An outdoor temperature sensor.
+- Optional: an indoor dew-point sensor for floor cooling protection.
 - Optional: a heat pump, mixing valve, or automation that uses Thermozona's helper entities.
 
 Circuit entities can be real switches, relay outputs, KNX switches, Zigbee relays, ESPHome outputs, MQTT switches, or `input_boolean` helpers for testing.
@@ -90,6 +92,7 @@ After startup you should see:
 - `climate.thermozona_living_room`
 - `climate.thermozona_bathroom`
 - `select.thermozona_heat_pump_mode`
+- `select.thermozona_cooling_strategy`
 - `sensor.thermozona_heat_pump_status`
 - `number.thermozona_flow_temperature`
 - `sensor.thermozona_flow_temperature`
@@ -107,7 +110,8 @@ Use these entities on the plant side:
 - `number.thermozona_flow_temperature`: current target supply temperature calculated by Thermozona.
 - `sensor.thermozona_flow_temperature`: same calculated flow temperature as a sensor with history and diagnostic attributes.
 - `select.thermozona_heat_pump_mode`: internal selector for `auto`, `heat`, `cool`, or `off`, unless you configure an external mode entity.
-- `number.thermozona_flow_curve_offset`: temporary offset for tuning the heating/cooling curve from the UI.
+- `select.thermozona_cooling_strategy`: selects `auto` or `air_coil_only` cooling; its selection is restored across restarts.
+- `number.thermozona_flow_curve_offset`: runtime offset for tuning the heating/cooling curve from the UI, restored across restarts.
 
 For an Ecoforest Modbus example, see [`docs/heatpump-ecoforest.md`](docs/heatpump-ecoforest.md).
 
@@ -146,6 +150,9 @@ thermozona:
   flow_curve_offset: 0.0
   weather_slope_heat: 0.25
   weather_slope_cool: 0.20
+  auto_heat_lockout_above_c: 18.0
+  auto_cool_lockout_below_c: 20.0
+  auto_min_changeover_minutes: 30
 
   flow:
     write_deadband_c: 0.3
@@ -183,7 +190,10 @@ thermozona:
 | `flow_curve_offset` | No | `0.0` | Baseline offset applied to both heating and cooling flow calculations. |
 | `weather_slope_heat` | No | `0.25` | Heating weather compensation slope. |
 | `weather_slope_cool` | No | `0.20` | Cooling weather compensation slope. |
-| `flow` | No | see schema | Flow write throttling, supervised heating tuning, and optional preheat settings. |
+| `auto_heat_lockout_above_c` | No | `18.0` | Disables automatic heating above this outdoor temperature. |
+| `auto_cool_lockout_below_c` | No | `20.0` | Disables automatic cooling below this outdoor temperature. |
+| `auto_min_changeover_minutes` | No | `30` | Minimum interval between automatic heat/cool changes, range `0` to `1440` minutes. |
+| `flow` | No | see schema | Flow write throttling, supervised heating tuning, preheat, and cooling settings. |
 
 ### Zone Options
 
@@ -200,10 +210,23 @@ thermozona:
 | `pwm_ki` | No | `2.0` | PWM integral gain. |
 | `pwm_actuator_delay` | No | `3` | Delay compensation for slow thermal actuators, in minutes. |
 | `zone_response` | No | `slow` | `slow` or `fast`, used by the heating flow calculation. |
-| `zone_flow_weight` | No | `1.0` | Demand weighting for the heating flow calculation. |
+| `zone_flow_weight` | No | `1.0` | Demand weighting for heating flow and automatic heat/cool selection. |
 | `zone_solar_weight` | No | `1.0` | Solar softening weight for preheat compensation. |
+| `zone_type` | No | `floor` | `floor`, `wall`, or `air_coil`. |
+| `air_coil_requested_water_sensor` | No | `sensor.thermozona_flow_temperature` | Requested supply-water temperature entity in °C for the air-coil heating interlock. |
+| `air_coil_measured_water_sensor` | No | `sensor.heatpump_heating_out` | Measured supply-water temperature entity in °C for the air-coil heating interlock. |
+| `heating_min_flow_c` | No | none | Heating flow minimum requested while this zone is active and below target, range `15` to `35`°C. Changes are ramped. |
+| `floor_material` | No | none | `wood` adds 1°C to the default dew-point margin unless a zone margin is explicitly configured. |
+| `cooling_dewpoint_margin` | No | flow default | Zone-specific degrees above indoor dew point required during protected cooling, range `0` to `10`°C. |
+| `cooling_dewpoint_protection` | No | `true` | Applies dew-point protection to this floor/wall zone when a dew-point sensor is configured. |
 
 Legacy `groups` is still accepted as an alias for `circuits`, but new configs should use `circuits`.
+
+### Automatic Mode
+
+Automatic mode uses room temperature errors weighted by `zone_flow_weight`, ignoring errors within 0.2°C of target. It idles when there is no net demand, when the requested direction is locked out by outdoor temperature, or when the configured outdoor sensor has no valid value.
+
+With the defaults, heating is allowed at or below 18°C outdoors and cooling at or above 20°C. A change between heating and cooling normally waits 30 minutes, idling during the wait. The changeover wait is bypassed when outdoor temperature already locks out the previous direction. Explicit `heat` and `cool` modes bypass these automatic lockouts.
 
 ## Flow Temperature Calculation
 
@@ -254,6 +277,57 @@ thermozona:
 
 `preheat_forecast_sensor` should expose a forecast outdoor temperature in degrees Celsius. `preheat_solar_sensor` should expose forecast solar irradiance in `W/m2`.
 
+### Cooling and Dew-Point Protection
+
+Cooling settings inside `flow`:
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `cooling_dewpoint_sensor` | none | Indoor dew-point sensor in °C. Protection requires a configured sensor. |
+| `cooling_floor_dewpoint_margin` | `2.0` | Default margin above dew point for protected floor/wall zones, range `0` to `10`°C. |
+| `cooling_dehumidification_min_flow` | `5.0` | Lower cooling flow bound, range `5` to `25`°C. |
+| `cooling_air_coil_only_offset` | `0.0` | Extra degrees subtracted from flow when only air-coil zones cool, range `0` to `15`°C. |
+
+For example, merge these settings into your existing configuration:
+
+```yaml
+thermozona:
+  flow:
+    cooling_dewpoint_sensor: sensor.indoor_dewpoint
+    cooling_floor_dewpoint_margin: 2.0
+    cooling_dehumidification_min_flow: 5.0
+    cooling_air_coil_only_offset: 5.0
+  zones:
+    living_room:
+      temp_sensor: sensor.living_room_temperature
+      circuits:
+        - switch.manifold_living
+      zone_type: floor
+      floor_material: wood
+    ventilation_coil:
+      temp_sensor: sensor.indoor_temperature
+      circuits:
+        - switch.ventilation_coil
+      zone_type: air_coil
+      zone_response: fast
+      air_coil_requested_water_sensor: sensor.thermozona_flow_temperature
+      air_coil_measured_water_sensor: sensor.heat_pump_supply_temperature
+```
+
+Protected floor/wall zones raise the shared flow target to at least indoor dew point plus their margin. They close when that constraint exceeds 25°C or conflicts with colder air-coil demand. A configured dew-point sensor becoming unavailable also closes protected zones and blocks cooling commands while protected floor circuits remain active. Setting `cooling_dewpoint_protection: false` explicitly excludes a zone from this protection. Without a configured dew-point sensor, no dew-point limit is applied.
+
+Selecting `air_coil_only` closes all floor/wall cooling zones, including zones with dew-point protection disabled. `auto` lets zones participate according to demand and dew-point constraints. Air-coil-only demand can use the lower cooling bound and extra offset for dehumidification.
+
+### Per-Zone Heating Minimums
+
+A wall zone can set `heating_min_flow_c: 32.0`, for example. Its minimum contributes only while its circuit is active and its room remains below target. After the initial command, the shared command ramps up by at most 1.5°C and down by at most 2°C per five minutes, alongside the normal heating curve slew limits.
+
+### Air-Coil Heating Interlock
+
+Air-coil heating closes when requested or measured water reaches 27°C, and reopens only once both values are at or below 25°C. Missing or invalid water readings also keep it closed.
+
+Set `air_coil_requested_water_sensor` and `air_coil_measured_water_sensor` on each `air_coil` zone to match your installation. Both entities must report temperatures in °C. The defaults preserve existing configurations: `sensor.thermozona_flow_temperature` for requested water temperature and `sensor.heatpump_heating_out` for measured water temperature. An unavailable configured sensor keeps air-coil heating closed; the interlock does not apply during cooling.
+
 ## Zone Control Modes
 
 ### `control_mode: bang_bang`
@@ -292,6 +366,8 @@ After changing `configuration.yaml`, use one of these options:
 
 Thermozona re-imports YAML on setup and reload so the YAML file remains the source of truth.
 
+During integration unload/reload, pending control work is cancelled and circuits are closed. Startup holds control off until the mode and flow output platforms are ready. A missing or unavailable external mode entity keeps control off. Invalid room temperatures close the affected zone and reset its PWM state.
+
 ## Debugging
 
 Enable debug logging:
@@ -316,16 +392,21 @@ Useful checks:
 
 Common attributes include:
 
-- `effective_mode`: `heat` or `cool`.
+- `effective_mode`: `heat`, `cool`, or `idle` when a previous command becomes inactive.
+- `command_active`: whether the cached flow value currently represents active demand.
+- `command_updated_at`: timestamp of the latest command calculation or deactivation.
+- `active_zones`: zones participating in the active command.
 - `outside_temp_c`: outdoor temperature used in the calculation.
 - `flow_curve_offset_c`: active flow curve offset.
 - `flow_temp_unclamped_c`: calculated value before clamping.
 - `flow_temp_c`: final value after clamping.
 - `clamp_min_c` and `clamp_max_c`: applied bounds.
 
-Cooling adds values such as `target_ref_c`, `base_offset_c`, `weather_slope`, and `weather_comp_c`.
+Cooling adds values such as `target_ref_c`, `base_offset_c`, `weather_slope`, `weather_comp_c`, `cooling_dewpoint_c`, `cooling_floor_constraint_c`, `cooling_air_coil_only_mode`, `cooling_active_floor_zones`, `cooling_active_air_coil_zones`, and `cooling_suppressed_floor_zones`.
 
-Heating adds values such as `demand_index`, `di_slow`, `di_fast`, `trim_p_c`, `integral_c`, `fast_boost_c`, and `preheat_boost_c`.
+Heating adds values such as `demand_index`, `di_slow`, `di_fast`, `trim_p_c`, `integral_c`, `fast_boost_c`, `preheat_boost_c`, `active_zone_min_flow_c`, and `active_min_flow_zones`.
+
+The last numeric flow value is retained when demand ends. Use `command_active` and heat pump status to distinguish it from a current command.
 
 ## Safety
 

@@ -1,7 +1,9 @@
 """Thermostat entity for the Thermozona integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -12,7 +14,12 @@ from homeassistant.components.climate import (
     HVACAction,
     HVACMode,
 )
-from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+    UnitOfTemperature,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import (
     async_track_state_change_event,
@@ -23,6 +30,8 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from . import (
     CONTROL_MODE_BANG_BANG,
     CONTROL_MODE_PWM,
+    DEFAULT_AIR_COIL_MEASURED_WATER_SENSOR,
+    DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR,
     DEFAULT_PWM_ACTUATOR_DELAY,
     DEFAULT_PWM_CYCLE_TIME,
     DEFAULT_PWM_KI,
@@ -35,6 +44,7 @@ from . import (
     DOMAIN,
 )
 from .heat_pump import HeatPumpController
+from .helpers import air_coil_heating_suppressed
 from .pro.pwm import (
     calculate_on_time_minutes,
     calculate_pwm_duty,
@@ -82,6 +92,13 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         zone_response: str | None = None,
         zone_flow_weight: float | None = None,
         zone_solar_weight: float | None = None,
+        zone_type: str | None = None,
+        floor_material: str | None = None,
+        cooling_dewpoint_margin: float | None = None,
+        cooling_dewpoint_protection: bool | None = None,
+        heating_min_flow_c: float | None = None,
+        air_coil_requested_water_sensor: str | None = None,
+        air_coil_measured_water_sensor: str | None = None,
     ) -> None:
         """Initialize the thermostat."""
         self.hass = hass
@@ -104,8 +121,11 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         self._controller = controller
         self._pending_control = False
         self._reschedule_control = False
+        self._control_task: asyncio.Task | None = None
+        self._is_removing = False
         self._manual_mode: HVACMode = HVACMode.AUTO
         self._effective_mode: HVACMode = HVACMode.AUTO
+        self._air_coil_heat_suppressed = False
         self._mode_listener_entity: str | None = None
         self._hysteresis: float = (
             hysteresis if hysteresis is not None else DEFAULT_HYSTERESIS
@@ -131,12 +151,31 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             else DEFAULT_ZONE_FLOW_WEIGHT
         )
         self._zone_flow_weight = max(0.0, self._zone_flow_weight)
+        self._heating_min_flow_c = heating_min_flow_c
         self._zone_solar_weight = (
             float(zone_solar_weight)
             if zone_solar_weight is not None
             else DEFAULT_ZONE_SOLAR_WEIGHT
         )
         self._zone_solar_weight = max(0.0, self._zone_solar_weight)
+        self._zone_type = (zone_type or "floor").lower()
+        self._air_coil_requested_water_sensor = (
+            air_coil_requested_water_sensor or DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR
+        )
+        self._air_coil_measured_water_sensor = (
+            air_coil_measured_water_sensor or DEFAULT_AIR_COIL_MEASURED_WATER_SENSOR
+        )
+        self._floor_material = (floor_material or "").lower() or None
+        self._cooling_dewpoint_margin = (
+            float(cooling_dewpoint_margin)
+            if cooling_dewpoint_margin is not None
+            else None
+        )
+        self._cooling_dewpoint_protection = (
+            True
+            if cooling_dewpoint_protection is None
+            else bool(cooling_dewpoint_protection)
+        )
 
         self._pwm_cycle_start: datetime | None = None
         self._pwm_on_time = timedelta()
@@ -191,16 +230,35 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed."""
-        if self._remove_update_handler is not None:
-            self._remove_update_handler()
-        if self._remove_mode_listener is not None:
-            self._remove_mode_listener()
-        if self._remove_temp_sensor_listener is not None:
-            self._remove_temp_sensor_listener()
+        await self.async_prepare_shutdown()
         self._controller.update_zone_status(
             self._zone_name, target=None, current=None, source=self
         )
         self._controller.unregister_thermostat(self)
+
+    async def async_prepare_shutdown(self) -> None:
+        """Stop listeners and pending control work before circuits are closed."""
+        self._is_removing = True
+        self._reschedule_control = False
+        if self._remove_update_handler is not None:
+            self._remove_update_handler()
+            self._remove_update_handler = None
+        if self._remove_mode_listener is not None:
+            self._remove_mode_listener()
+            self._remove_mode_listener = None
+        if self._remove_temp_sensor_listener is not None:
+            self._remove_temp_sensor_listener()
+            self._remove_temp_sensor_listener = None
+
+        control_task = self._control_task
+        if control_task is not None and not control_task.done():
+            control_task.cancel()
+            try:
+                await control_task
+            except asyncio.CancelledError:
+                pass
+        self._control_task = None
+        self._pending_control = False
 
     @property
     def current_temperature(self) -> float | None:
@@ -211,15 +269,27 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         temp_state = self.hass.states.get(self._temp_sensor)
 
         if temp_state is None:
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "%s: Temperature sensor %s not found",
                 self._attr_name,
                 self._temp_sensor,
             )
             return None
 
+        if temp_state.state in {STATE_UNKNOWN, STATE_UNAVAILABLE}:
+            _LOGGER.debug(
+                "%s: Temperature sensor %s is %s; keeping circuits fail-safe off",
+                self._attr_name,
+                self._temp_sensor,
+                temp_state.state,
+            )
+            return None
+
         try:
-            return float(temp_state.state)
+            temperature = float(temp_state.state)
+            if not math.isfinite(temperature):
+                raise ValueError("temperature is not finite")
+            return temperature
         except (ValueError, TypeError) as exc:
             _LOGGER.error(
                 "%s: Could not convert temperature '%s' to float: %s",
@@ -242,7 +312,15 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             "pwm_zone_count": self._pwm_zone_count,
             "zone_response": self._zone_response,
             "zone_flow_weight": round(self._zone_flow_weight, 2),
+            "heating_min_flow_c": self._heating_min_flow_c,
+            "air_coil_heat_suppressed": (
+                self._air_coil_heat_suppressed if self._zone_type == "air_coil" else None
+            ),
             "zone_solar_weight": round(self._zone_solar_weight, 2),
+            "zone_type": self._zone_type,
+            "floor_material": self._floor_material,
+            "cooling_dewpoint_margin": self._cooling_dewpoint_margin,
+            "cooling_dewpoint_protection": self._cooling_dewpoint_protection,
             PWM_INTEGRAL_KEY: round(self._pwm_integral, 4),
         }
 
@@ -289,10 +367,11 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
     async def _control_heating(self) -> None:
         """Control the heating based on configured strategy."""
         if self._manual_mode == HVACMode.OFF:
+            self._air_coil_heat_suppressed = False
             self._controller.update_zone_status(
                 self._zone_name, target=None, current=None, source=self
             )
-            await self._set_circuits_state(False)
+            await self._set_circuits_state(False, force_idle=True)
             self._attr_hvac_action = HVACAction.OFF
             self._effective_mode = HVACMode.OFF
             self.async_write_ha_state()
@@ -300,9 +379,32 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
 
         current_temp = self.current_temperature
         if current_temp is None:
-            self._controller.update_zone_status(
-                self._zone_name, target=None, current=None, source=self
-            )
+            circuits_closed = await self._set_circuits_state(False, force_idle=True)
+            self._reset_pwm_state(reset_integral=True)
+            self._attr_hvac_action = HVACAction.IDLE
+            if circuits_closed:
+                self._controller.update_zone_status(
+                    self._zone_name, target=None, current=None, source=self
+                )
+            else:
+                self._controller.update_zone_status(
+                    self._zone_name,
+                    target=self._attr_target_temperature,
+                    current=self._attr_target_temperature,
+                    active=True,
+                    duty_cycle=0.0,
+                    zone_response=self._zone_response,
+                    zone_flow_weight=self._zone_flow_weight,
+                    heating_min_flow_c=self._heating_min_flow_c,
+                    zone_solar_weight=self._zone_solar_weight,
+                    zone_type=self._zone_type,
+                    floor_material=self._floor_material,
+                    cooling_dewpoint_margin=self._cooling_dewpoint_margin,
+                    cooling_dewpoint_protection=self._cooling_dewpoint_protection,
+                    cooling_suppressed=False,
+                    source=self,
+                )
+                await self._controller.async_update_heat_pump_state()
             self.async_write_ha_state()
             return
 
@@ -315,7 +417,12 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             duty_cycle=self._current_zone_duty_hint(active_before),
             zone_response=self._zone_response,
             zone_flow_weight=self._zone_flow_weight,
+            heating_min_flow_c=self._heating_min_flow_c,
             zone_solar_weight=self._zone_solar_weight,
+            zone_type=self._zone_type,
+            floor_material=self._floor_material,
+            cooling_dewpoint_margin=self._cooling_dewpoint_margin,
+            cooling_dewpoint_protection=self._cooling_dewpoint_protection,
             source=self,
         )
 
@@ -323,6 +430,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         effective_mode = self._resolve_effective_mode(pump_mode)
 
         if pump_mode == "off":
+            self._air_coil_heat_suppressed = False
             await self._set_circuits_state(False)
             self._attr_hvac_action = HVACAction.OFF
             self._effective_mode = HVACMode.OFF
@@ -335,13 +443,103 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
                 duty_cycle=0.0,
                 zone_response=self._zone_response,
                 zone_flow_weight=self._zone_flow_weight,
+                heating_min_flow_c=self._heating_min_flow_c,
                 zone_solar_weight=self._zone_solar_weight,
+                zone_type=self._zone_type,
+                floor_material=self._floor_material,
+                cooling_dewpoint_margin=self._cooling_dewpoint_margin,
+                cooling_dewpoint_protection=self._cooling_dewpoint_protection,
+                cooling_suppressed=False,
                 source=self,
             )
             self.async_write_ha_state()
             return
 
-        if self._control_mode == CONTROL_MODE_PWM:
+        if effective_mode == HVACMode.OFF:
+            await self._set_circuits_state(False, force_idle=True)
+            self._attr_hvac_action = HVACAction.IDLE
+            self._effective_mode = HVACMode.OFF
+            self._reset_pwm_state(reset_integral=True)
+            self._controller.update_zone_status(
+                self._zone_name,
+                target=self._attr_target_temperature,
+                current=current_temp,
+                active=False,
+                duty_cycle=0.0,
+                zone_response=self._zone_response,
+                zone_flow_weight=self._zone_flow_weight,
+                heating_min_flow_c=self._heating_min_flow_c,
+                zone_solar_weight=self._zone_solar_weight,
+                zone_type=self._zone_type,
+                floor_material=self._floor_material,
+                cooling_dewpoint_margin=self._cooling_dewpoint_margin,
+                cooling_dewpoint_protection=self._cooling_dewpoint_protection,
+                cooling_suppressed=False,
+                source=self,
+            )
+            self.async_write_ha_state()
+            return
+
+        if (
+            effective_mode == HVACMode.COOL
+            and self._zone_type != "air_coil"
+            and self._controller.should_suppress_floor_cooling(
+                zone_type=self._zone_type,
+                target=self._attr_target_temperature,
+                current=current_temp,
+                floor_material=self._floor_material,
+                cooling_dewpoint_margin=self._cooling_dewpoint_margin,
+                cooling_dewpoint_protection=self._cooling_dewpoint_protection,
+            )
+        ):
+            circuits_closed = await self._set_circuits_state(False)
+            self._attr_hvac_action = HVACAction.IDLE
+            self._effective_mode = effective_mode
+            self._reset_pwm_state(reset_integral=False)
+            self._controller.update_zone_status(
+                self._zone_name,
+                target=self._attr_target_temperature,
+                current=current_temp,
+                active=not circuits_closed,
+                duty_cycle=0.0 if circuits_closed else 100.0,
+                zone_response=self._zone_response,
+                zone_flow_weight=self._zone_flow_weight,
+                heating_min_flow_c=self._heating_min_flow_c,
+                zone_solar_weight=self._zone_solar_weight,
+                zone_type=self._zone_type,
+                floor_material=self._floor_material,
+                cooling_dewpoint_margin=self._cooling_dewpoint_margin,
+                cooling_dewpoint_protection=self._cooling_dewpoint_protection,
+                cooling_suppressed=circuits_closed,
+                source=self,
+            )
+            if not circuits_closed:
+                await self._controller.async_update_heat_pump_state()
+            self.async_write_ha_state()
+            return
+
+        if self._zone_type == "air_coil" and effective_mode == HVACMode.HEAT:
+            requested = self._entity_temperature(self._air_coil_requested_water_sensor)
+            measured = self._entity_temperature(self._air_coil_measured_water_sensor)
+            suppressed = air_coil_heating_suppressed(
+                requested, measured, self._air_coil_heat_suppressed
+            )
+            if suppressed != self._air_coil_heat_suppressed:
+                _LOGGER.info(
+                    "%s: Air-coil water interlock %s (requested=%s, measured=%s)",
+                    self._attr_name,
+                    "closed" if suppressed else "released",
+                    requested,
+                    measured,
+                )
+            self._air_coil_heat_suppressed = suppressed
+        else:
+            self._air_coil_heat_suppressed = False
+
+        if self._air_coil_heat_suppressed:
+            await self._set_circuits_state(False)
+            self._attr_hvac_action = HVACAction.IDLE
+        elif self._control_mode == CONTROL_MODE_PWM:
             await self._control_heating_pwm(current_temp, effective_mode)
         else:
             await self._control_heating_bang_bang(current_temp, effective_mode)
@@ -356,10 +554,25 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             duty_cycle=self._current_zone_duty_hint(active_after),
             zone_response=self._zone_response,
             zone_flow_weight=self._zone_flow_weight,
+            heating_min_flow_c=self._heating_min_flow_c,
             zone_solar_weight=self._zone_solar_weight,
+            zone_type=self._zone_type,
+            floor_material=self._floor_material,
+            cooling_dewpoint_margin=self._cooling_dewpoint_margin,
+            cooling_dewpoint_protection=self._cooling_dewpoint_protection,
+            cooling_suppressed=False,
             source=self,
         )
         self.async_write_ha_state()
+
+    def _entity_temperature(self, entity_id: str) -> float | None:
+        """Read a water temperature, treating missing data as unsafe for the coil."""
+        state = self.hass.states.get(entity_id)
+        try:
+            value = float(state.state) if state is not None else float("nan")
+            return value if math.isfinite(value) else None
+        except (TypeError, ValueError):
+            return None
 
     def _current_zone_duty_hint(self, is_active: bool) -> float:
         """Return zone demand proxy for flow-supervisor calculations."""
@@ -514,6 +727,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
 
     def async_schedule_control(self) -> None:
         """Schedule a control evaluation if one isn't already running."""
+        if self._is_removing:
+            return
         if self._pending_control:
             self._reschedule_control = True
             return
@@ -523,13 +738,14 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
                 await self._control_heating()
             finally:
                 self._pending_control = False
-                if self._reschedule_control:
+                self._control_task = None
+                if self._reschedule_control and not self._is_removing:
                     self._reschedule_control = False
                     self.async_schedule_control()
 
         self._pending_control = True
         self._reschedule_control = False
-        self.hass.async_create_task(_run())
+        self._control_task = self.hass.async_create_task(_run())
 
     async def async_update_mode_listener(self) -> None:
         """Subscribe to heat pump mode changes (internal or external)."""
@@ -564,7 +780,9 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
                 self._handle_temp_sensor_change,
             )
 
-    async def _set_circuits_state(self, state: bool) -> None:
+    async def _set_circuits_state(
+        self, state: bool, *, force_idle: bool = False
+    ) -> bool:
         """Set all circuits to the specified state."""
         for circuit_entity_id in self._circuits:
             try:
@@ -575,6 +793,22 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
                         self._attr_name,
                         circuit_entity_id,
                     )
+                    continue
+
+                desired_state = "on" if state else "off"
+                circuit_state = self.hass.states.get(circuit_entity_id)
+                if state and (
+                    circuit_state is None
+                    or circuit_state.state in {STATE_UNKNOWN, STATE_UNAVAILABLE}
+                ):
+                    _LOGGER.debug(
+                        "%s: Circuit %s is not available; skipping %s during this cycle",
+                        self._attr_name,
+                        circuit_entity_id,
+                        desired_state,
+                    )
+                    continue
+                if circuit_state is not None and circuit_state.state == desired_state:
                     continue
 
                 await self.hass.services.async_call(
@@ -594,7 +828,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         if not state and self._manual_mode == HVACMode.OFF:
             self._attr_hvac_action = HVACAction.OFF
 
-        await self._controller.async_update_heat_pump_state()
+        await self._controller.async_update_heat_pump_state(force_idle=force_idle)
+        return self._circuits_are_active() if state else self._circuits_are_confirmed_off()
 
     def _circuits_are_active(self) -> bool:
         """Return True if any circuit is currently on."""
@@ -603,6 +838,14 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             if state and state.state == "on":
                 return True
         return False
+
+    def _circuits_are_confirmed_off(self) -> bool:
+        """Return True only when every circuit explicitly reports off."""
+        for circuit_entity_id in self._circuits:
+            state = self.hass.states.get(circuit_entity_id)
+            if state is None or state.state != "off":
+                return False
+        return True
 
     @staticmethod
     def _prettify(name: str) -> str:

@@ -59,14 +59,22 @@ thermozona:
   outside_temp_sensor: sensor.test_buiten_temperatuur
   # heating_base_offset: 3.0
   # weather_slope_heat: 0.25
+  # auto_heat_lockout_above_c: 18.0
+  # auto_cool_lockout_below_c: 20.0
+  # auto_min_changeover_minutes: 30
 
   # Optional flow calculation tuning.
   # Keep it small here; see README for the full tuning matrix.
   flow:
+    write_deadband_c: 0.3
     # preheat_enabled: true
     # preheat_forecast_sensor: sensor.outdoor_forecast_2h
     # preheat_solar_sensor: sensor.solar_irradiance_forecast_2h
     # preheat_solar_gain_per_w_m2: 0.002
+    # cooling_dewpoint_sensor: sensor.indoor_dewpoint
+    # cooling_floor_dewpoint_margin: 2.0
+    # cooling_dehumidification_min_flow: 5.0
+    # cooling_air_coil_only_offset: 5.0
 
   zones:
     woonkamer:
@@ -79,6 +87,13 @@ thermozona:
       # zone_response: slow
       # zone_flow_weight: 1.0
       # zone_solar_weight: 1.4
+      # zone_type: floor
+      # floor_material: wood
+      # cooling_dewpoint_margin: 2.0
+      # cooling_dewpoint_protection: true
+      # For an air-coil zone, use zone_type: air_coil and set its water sensors:
+      # air_coil_requested_water_sensor: sensor.thermozona_flow_temperature
+      # air_coil_measured_water_sensor: sensor.heat_pump_supply_temperature
 
     keuken:
       circuits:
@@ -88,3 +103,5 @@ thermozona:
       # zone_response: slow
       # zone_flow_weight: 1.0
       # zone_solar_weight: 0.2
+      # zone_type: wall
+      # heating_min_flow_c: 32.0
