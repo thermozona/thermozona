@@ -29,13 +29,14 @@ async def async_setup_entry(
 
     controller = domain_data["controllers"][config_entry.entry_id]
 
-    async_add_entities(
-        [
+    entities = [
             ThermozonaHeatPumpStatusSensor(config_entry.entry_id, controller),
             ThermozonaFlowTemperatureSensor(config_entry.entry_id, controller),
             ThermozonaPriceChargingSensor(config_entry.entry_id, controller),
         ]
-    )
+    if controller.hot_water is not None:
+        entities.append(ThermozonaHotWaterSensor(config_entry.entry_id, controller))
+    async_add_entities(entities)
 
 
 class ThermozonaHeatPumpStatusSensor(SensorEntity):
@@ -128,6 +129,13 @@ class ThermozonaFlowTemperatureSensor(SensorEntity):
 class ThermozonaPriceChargingSensor(SensorEntity):
     """Expose the current charging phase and the next planned window."""
 
+    _manager_name = "price_charging"
+    _id_suffix = "price_charging_status"
+
+    @property
+    def manager(self):
+        return getattr(self._controller, self._manager_name)
+
     _attr_has_entity_name = True
     _attr_name = "Price Charging"
     _attr_should_poll = False
@@ -135,7 +143,7 @@ class ThermozonaPriceChargingSensor(SensorEntity):
 
     def __init__(self, entry_id: str, controller: HeatPumpController) -> None:
         self._controller = controller
-        self._attr_unique_id = f"{entry_id}_price_charging_status"
+        self._attr_unique_id = f"{entry_id}_{self._id_suffix}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry_id)}, "name": "Thermozona"
         }
@@ -144,17 +152,17 @@ class ThermozonaPriceChargingSensor(SensorEntity):
     @property
     def native_value(self) -> str:
         """Return off, preview, normal, charging, coasting, or unavailable."""
-        return self._controller.price_charging.state
+        return self.manager.state
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return the current plan and price diagnostics."""
-        return self._controller.price_charging.attributes
+        return self.manager.attributes
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to plan updates."""
         await super().async_added_to_hass()
-        self._unsubscribe = self._controller.price_charging.subscribe(
+        self._unsubscribe = self.manager.subscribe(
             self.async_write_ha_state
         )
         self.async_write_ha_state()
@@ -165,3 +173,12 @@ class ThermozonaPriceChargingSensor(SensorEntity):
             self._unsubscribe()
             self._unsubscribe = None
         await super().async_will_remove_from_hass()
+
+
+class ThermozonaHotWaterSensor(ThermozonaPriceChargingSensor):
+    """Expose hot-water planning and observed tank conditions."""
+
+    _manager_name = "hot_water"
+    _id_suffix = "hot_water_status"
+    _attr_name = "Hot Water"
+    _attr_icon = "mdi:water-boiler"

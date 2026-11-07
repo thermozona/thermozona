@@ -1864,3 +1864,53 @@ async def test_default_price_charging_does_not_fetch_and_removes_timer(fake_hass
     fake_hass.services.async_call.assert_not_called()
     await manager.async_stop()
     remove.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode,temperature,expected', [('monitor','49.9',False),('auto','unavailable',False),('auto','49.9',True)])
+async def test_hot_water_respects_monitor_and_sensor_validity(fake_hass,mode,temperature,expected):
+    from custom_components.thermozona.hot_water import HotWaterManager
+    now=datetime.now(timezone.utc)
+    config={'mode':mode,'temperature_sensor':'sensor.tank','soc_sensor':'sensor.soc',
+            'demand_entity':'input_boolean.dhw','source_entity':'input_select.source',
+            'last_off_entity':'input_datetime.off','started_at_entity':'input_datetime.start',
+            'start_service':'input_boolean.turn_on','stop_service':'input_boolean.turn_off',
+            'start_data':{'entity_id':'input_boolean.dhw'},'stop_data':{'entity_id':'input_boolean.dhw'}}
+    manager=HotWaterManager(fake_hass,config)
+    manager._prices.async_refresh=AsyncMock()
+    manager._prices._slots=[PriceSlot(now-timedelta(hours=1),now+timedelta(hours=3),.1)]
+    manager.window=ChargeWindow(now-timedelta(minutes=1),now+timedelta(hours=1),.1,.1)
+    for entity,value in [('sensor.tank',temperature),('sensor.soc','24'),('input_boolean.dhw','off'),('input_select.source','none'),('input_datetime.off',''),('input_datetime.start','')]:
+        fake_hass.states.set(entity,value)
+    fake_hass.states.get('input_datetime.off').attributes={'timestamp':now.timestamp()-18000}
+    fake_hass.states.get('input_datetime.start').attributes={'timestamp':now.timestamp()-86400}
+    fake_hass.services.async_call=AsyncMock()
+    await manager.async_refresh()
+    assert manager._owned is expected
+    if expected:
+        assert manager.state=='requested'
+        fake_hass.states.set('input_boolean.dhw','on')
+        fake_hass.states.set('input_select.source','price')
+        await manager.async_refresh()
+        assert manager._owned
+        manager.window=ChargeWindow(now-timedelta(hours=2),now-timedelta(minutes=1),.1,.1)
+        await manager.async_refresh()
+        assert not manager._owned
+        assert any(c.args[1]=='turn_off' for c in fake_hass.services.async_call.call_args_list)
+    else:
+        fake_hass.services.async_call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_price_and_hot_water_select_listener_lifecycle(fake_hass):
+    from custom_components.thermozona.select import ThermozonaPriceChargingSelect,ThermozonaHotWaterSelect
+    from custom_components.thermozona.hot_water import HotWaterManager
+    controller=HeatPumpController(fake_hass,_config())
+    controller.hot_water=HotWaterManager(fake_hass,{"mode":"monitor"})
+    for cls,manager in [(ThermozonaPriceChargingSelect,controller.price_charging),(ThermozonaHotWaterSelect,controller.hot_water)]:
+        entity=cls("entry-1",controller)
+        await entity.async_added_to_hass()
+        manager._notify()
+        assert entity._attr_current_option==manager.mode
+        await entity.async_will_remove_from_hass()
+        assert not manager._listeners

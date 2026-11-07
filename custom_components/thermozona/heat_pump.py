@@ -33,6 +33,7 @@ from . import (
     CONF_PRO_PREHEAT_SOLAR_SENSOR,
     CONF_OUTSIDE_TEMP_SENSOR,
     CONF_PRICE_CHARGING,
+    CONF_HOT_WATER,
     CONF_WEATHER_SLOPE_COOL,
     CONF_WEATHER_SLOPE_HEAT,
     CONF_WRITE_DEADBAND_C,
@@ -57,6 +58,7 @@ from . import (
     ZONE_TYPE_AIR_COIL,
 )
 from .helpers import resolve_circuits
+from .hot_water import HotWaterManager
 from .price_charging import PriceChargingManager
 from .pro.flow_curve import FlowCurveRuntimeManager
 from .pro.flow_supervisor import ProFlowSupervisor
@@ -126,6 +128,8 @@ class HeatPumpController:
             notify_thermostats=lambda: self._notify_thermostats(),
         )
         self._flow_supervisor = ProFlowSupervisor()
+        self.hot_water = (HotWaterManager(self._hass, entry_config[CONF_HOT_WATER])
+                          if CONF_HOT_WATER in entry_config else None)
         self.price_charging = PriceChargingManager(
             hass, entry_config.get(CONF_PRICE_CHARGING, {}), self._notify_thermostats
         )
@@ -1446,6 +1450,8 @@ class HeatPumpController:
         """Close all circuits and clear demand before unload or reload."""
         self._shutting_down = True
         await self.price_charging.async_stop()
+        if self.hot_water is not None:
+            await self.hot_water.async_stop()
         if self._demand_off_task is not None:
             self._demand_off_task.cancel()
             self._demand_off_task = None
@@ -1480,6 +1486,8 @@ class HeatPumpController:
     def refresh_entry_config(self, entry_config: dict[str, Any]) -> None:
         """Update internal reference to the config entry (for reload scenarios)."""
         self._entry_config = entry_config
+        self.hot_water = (HotWaterManager(self._hass, entry_config[CONF_HOT_WATER])
+                          if CONF_HOT_WATER in entry_config else None)
         self.price_charging = PriceChargingManager(
             self._hass, entry_config.get(CONF_PRICE_CHARGING, {}), self._notify_thermostats
         )

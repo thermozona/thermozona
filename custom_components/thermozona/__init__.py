@@ -70,6 +70,7 @@ CONF_ZONE_HEATING_MIN_FLOW = "heating_min_flow_c"
 CONF_ZONE_SOLAR_WEIGHT = "zone_solar_weight"
 CONF_ZONE_TYPE = "zone_type"
 CONF_PRICE_CHARGING = "price_charging"
+CONF_HOT_WATER = "hot_water"
 CONF_PRICE_MODE = "mode"
 CONF_PRICE_HOME = "home"
 CONF_PRICE_BOOST = "boost_c"
@@ -364,6 +365,19 @@ PRICE_CHARGING_SCHEMA = vol.Schema({
     ),
 })
 
+HOT_WATER_SCHEMA = vol.Schema({
+    **{vol.Required(key): cv.entity_id for key in (
+        "temperature_sensor", "soc_sensor", "demand_entity", "source_entity",
+        "last_off_entity", "started_at_entity",
+    )},
+    vol.Optional("grid_sensor"): cv.entity_id,
+    vol.Required("start_service"): cv.string,
+    vol.Required("stop_service"): cv.string,
+    vol.Optional("start_data", default={}): dict,
+    vol.Optional("stop_data", default={}): dict,
+    vol.Optional("mode", default="monitor"): vol.In(["off", "monitor", "auto"]),
+})
+
 CONFIG_SCHEMA = vol.Schema({
     DOMAIN: vol.Schema({
         vol.Required(CONF_OUTSIDE_TEMP_SENSOR): cv.entity_id,
@@ -406,6 +420,7 @@ CONFIG_SCHEMA = vol.Schema({
             default={},
         ): FLOW_SCHEMA,
         vol.Optional(CONF_PRICE_CHARGING, default={}): PRICE_CHARGING_SCHEMA,
+        vol.Optional(CONF_HOT_WATER): HOT_WATER_SCHEMA,
         vol.Required(CONF_ZONES): {
             cv.string: ZONE_SCHEMA
         }
@@ -500,6 +515,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await controller.price_charging.async_start()
+    if controller.hot_water is not None:
+        await controller.hot_water.async_start()
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

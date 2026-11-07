@@ -471,3 +471,32 @@ Issues, feature requests, and pull requests are welcome. Please include your rel
 ## License
 
 Thermozona is licensed under the MIT license. See [`LICENSE`](LICENSE).
+
+### Domestic Hot Water
+
+Optional `hot_water` support coordinates additional boiler charging through Home Assistant services. It does not require EVCC. The heat pump retains its native hot-water control; disabling Thermozona hot-water boosting does not disable ordinary hot-water production.
+
+```yaml
+thermozona:
+  hot_water:
+    mode: monitor
+    temperature_sensor: sensor.hot_water_temperature
+    soc_sensor: sensor.hot_water_soc
+    demand_entity: input_boolean.hot_water_request
+    source_entity: input_select.hot_water_source
+    last_off_entity: input_datetime.hot_water_last_off
+    started_at_entity: input_datetime.hot_water_started_at
+    grid_sensor: sensor.grid_power
+    start_service: input_boolean.turn_on
+    start_data:
+      entity_id: input_boolean.hot_water_request
+    stop_service: input_boolean.turn_off
+    stop_data:
+      entity_id: input_boolean.hot_water_request
+```
+
+The request entity must connect to your installation's existing protected start/stop automations. Those automations must record actual start/stop timestamps and enforce the equipment's minimum runtime. The source selector must provide `none`, `solar`, and `price`. Timestamp helpers must include both date and time.
+
+`select.thermozona_hot_water` offers `off`, `monitor`, and `auto`. Monitor fetches prices and displays the plan without requesting heat. Auto selects the cheapest complete one-hour block starting within the next 24 hours and requests a boost when SOC is below 40%, provided the four-hour cooldown has elapsed. Stable grid export above 2,500 W for five minutes can also request a solar boost. Solar requests end after five minutes of grid import above 500 W, or one minute of missing grid measurements. All additional requests end at 99% SOC, 65°C, invalid tank readings, or a 90-minute maximum runtime. Existing equipment protections and the Home Assistant actuation bridge remain necessary.
+
+`sensor.thermozona_hot_water` exposes temperature, SOC, request ownership, the selected window, and errors. This first implementation uses the timing and thresholds above; it does not replace native hygiene cycles or calculate stored energy from temperature.
