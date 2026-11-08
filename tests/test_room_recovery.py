@@ -13,6 +13,7 @@ from custom_components.thermozona.price_charging import PriceSlot
 from custom_components.thermozona.room_recovery import (
     HeatingRate, RoomRecovery, learn_heating_rate, overlap_seconds,
 )
+from custom_components.thermozona.thermal_conditions import ThermalReference
 
 UTC = timezone.utc
 END = datetime(2026, 11, 9, 17, tzinfo=UTC)
@@ -158,6 +159,41 @@ def test_offset_deadline_uses_absolute_time_across_dst():
     result = plan(ready_at=deadline, now=datetime(2026, 10, 24, 20, tzinfo=UTC))
     assert result.ready_at == datetime(2026, 10, 25, 1, 30, tzinfo=UTC)
     assert result.start == result.ready_at-timedelta(minutes=135)
+
+
+def test_recovery_adjusts_for_delivery_and_loss_without_exceeding_hard_limit():
+    assert plan(thermal_factor=.75).minutes == 105
+    assert plan(thermal_factor=1.25).minutes == 165
+    assert plan(thermal_factor=1.25, current=18).minutes == 180
+
+
+def test_learning_keeps_conditions_of_the_selected_observed_rate():
+    rows, intervals = observations()
+    water = [(t, 26) for t, _ in rows]
+    outside = [(t, 8) for t, _ in rows]
+    result = learn_heating_rate(rows, intervals, water, outside)
+    assert result.rate == pytest.approx(.4)
+    assert result.reference.supply_c == 26
+    assert result.reference.outside_c == 8
+    assert 18 <= result.reference.room_c <= 20
+    missing = learn_heating_rate(rows, intervals, [(t, None) for t, _ in water], outside)
+    assert missing.rate == pytest.approx(.4) and missing.reference is None
+
+
+def test_condition_history_is_time_weighted_and_rejects_stale_initial_values():
+    start = END-timedelta(hours=1)
+    rows = [(start, 24), (start+timedelta(minutes=15), 28)]
+    assert module._average_condition(rows, [t for t, _ in rows], start, END) == 27
+    stale = [(start-timedelta(hours=3), 24)]
+    assert module._average_condition(stale, [t for t, _ in stale], start, END) is None
+
+
+def test_sunlit_windows_are_not_learned_as_heater_only_warming():
+    rows, intervals = observations()
+    solar = [(t, 500) for t, _ in rows]
+    assert learn_heating_rate(rows, intervals, solar_forecasts=solar, solar_weight=1).rate is None
+    assert learn_heating_rate(rows, intervals, solar_forecasts=solar, solar_weight=0).rate == pytest.approx(.4)
+    assert learn_heating_rate(rows, intervals, solar_forecasts=[], solar_weight=1).rate is None
 
 
 @pytest.mark.asyncio

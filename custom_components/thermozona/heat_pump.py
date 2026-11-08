@@ -5,6 +5,7 @@ import asyncio
 import logging
 import math
 import weakref
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -36,6 +37,7 @@ from . import (
     CONF_PRICE_CHARGING,
     CONF_PWM_STAGGERING,
     CONF_HOT_WATER,
+    CONF_THERMAL_COMPENSATION,
     CONF_WEATHER_SLOPE_COOL,
     CONF_WEATHER_SLOPE_HEAT,
     CONF_WRITE_DEADBAND_C,
@@ -66,6 +68,7 @@ from .hot_water import HotWaterManager
 from .price_charging import PriceChargingManager
 from .pro.flow_curve import FlowCurveRuntimeManager
 from .pro.flow_supervisor import ProFlowSupervisor
+from .thermal_conditions import ThermalCompensation, ThermalReference, compensation
 
 if TYPE_CHECKING:
     from .thermostat import ThermozonaThermostat
@@ -221,6 +224,63 @@ class HeatPumpController:
 
     def _flow_config(self) -> dict[str, Any]:
         return self._entry_config.get(CONF_FLOW, {})
+
+    @property
+    def thermal_compensation_config(self) -> dict[str, Any]:
+        """Return the explicitly configured measured-water correction."""
+        return self._entry_config.get(CONF_THERMAL_COMPENSATION, {})
+
+    def thermal_compensation(
+        self, *, room_c: float | None, target_c: float, now: datetime,
+        reference: ThermalReference | None = None,
+        solar_weight: float = 0.0,
+    ) -> ThermalCompensation:
+        """Read fresh measured water and weather; never substitute the flow setpoint."""
+        config = self.thermal_compensation_config
+        if not config.get("enabled"):
+            return ThermalCompensation()
+        if self.space_heating_suspended:
+            return ThermalCompensation(reason="boiler_priority")
+        values = []
+        maximum_age = timedelta(minutes=config.get("max_sensor_age_minutes", 30))
+        for entity in (config.get("supply_sensor"), self._outside_temp_sensor()):
+            state = self._hass.states.get(entity) if entity else None
+            timestamp = getattr(state, "last_reported", None) or getattr(state, "last_updated", None)
+            if not isinstance(timestamp, datetime) or timestamp.tzinfo is None:
+                return ThermalCompensation(reason="missing_timestamp")
+            if not timedelta(minutes=-1) <= now - timestamp <= maximum_age:
+                return ThermalCompensation(reason="stale_conditions")
+            if getattr(state, "attributes", {}).get("unit_of_measurement", "°C") != "°C":
+                return ThermalCompensation(reason="invalid_units")
+            values.append(self._read_entity_float(entity))
+        solar = self._fresh_solar_forecast(now) if solar_weight > 0 else None
+        solar_equivalent = min(
+            1.0, (solar or 0) * config.get("solar_gain_per_w_m2", .002) * solar_weight
+        )
+        result = compensation(
+            supply_c=values[0], outside_c=values[1], room_c=room_c, target_c=target_c,
+            reference=reference or ThermalReference(
+                config.get("reference_supply_c", 25.0),
+                config.get("reference_outside_c", 10.0), target_c,
+            ),
+            solar_equivalent_c=solar_equivalent,
+        )
+        return replace(result, solar_w_m2=solar, solar_equivalent_c=(
+            solar_equivalent if result.reason == "active" else 0.0
+        ))
+
+    def _fresh_solar_forecast(self, now: datetime) -> float | None:
+        """Accept a bounded Celsius-independent irradiance forecast for up to three hours."""
+        entity = self.thermal_compensation_config.get("solar_forecast_sensor")
+        state = self._hass.states.get(entity) if entity else None
+        timestamp = getattr(state, "last_reported", None) or getattr(state, "last_updated", None)
+        if (not isinstance(timestamp, datetime) or timestamp.tzinfo is None
+                or not timedelta(minutes=-1) <= now - timestamp <= timedelta(hours=3)):
+            return None
+        if getattr(state, "attributes", {}).get("unit_of_measurement") not in {"W/m²", "W/m2"}:
+            return None
+        value = self._read_entity_float(entity)
+        return value if value is not None and 0 <= value <= 1500 else None
 
     def _outside_temp_sensor(self) -> str | None:
         return self._entry_config.get(CONF_OUTSIDE_TEMP_SENSOR)
@@ -494,11 +554,16 @@ class HeatPumpController:
             circuits.extend(resolve_circuits(zone_config))
         return circuits
 
+    @property
+    def platform_setup_pending(self) -> bool:
+        """Distinguish a temporary startup hold from an explicit user off command."""
+        return self._startup_guard_enabled and (
+            not self._mode_ready or not self._flow_output_ready
+        )
+
     def get_operation_mode(self) -> str:
         """Return the current heat pump operation mode (heat/cool/auto)."""
-        if self._startup_guard_enabled and (
-            not self._mode_ready or not self._flow_output_ready
-        ):
+        if self.platform_setup_pending:
             return "off"
 
         if self._mode_select_entity() is not None:

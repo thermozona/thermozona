@@ -188,6 +188,7 @@ thermozona:
 | `flow_temp_sensor` | No | internal number entity | Optional external `input_number` target for the calculated flow temperature. |
 | `heat_pump_mode` | No | internal select entity | Optional external entity for heat/cool/auto/off mode. |
 | `pwm_staggering` | No | `true` | Spread PWM zones over their cycles. Set `false` and use the same cycle length to group zone demand into shared heating/cooling windows. |
+| `thermal_compensation` | No | disabled | Bounded measured-water/outdoor correction for heating PWM and scheduled recovery; configure the actual supply sensor explicitly. |
 | `demand_off_delay_minutes` | No | `5` | Hold shared demand after the final circuit closes, range `0` to `30`. Set `0` to release demand immediately; the heat pump retains its native pump run-on and protections. |
 | `heating_base_offset` | No | `3.0` | Base degrees added above the warmest active target in heating. |
 | `cooling_base_offset` | No | `2.5` | Base degrees subtracted below the coolest active target in cooling. |
@@ -391,6 +392,62 @@ This is the default. Thermozona turns circuit outputs on when the room needs hea
 
 PWM mode calculates a 0-100% duty cycle each cycle. It is useful for high thermal-mass floors where plain on/off control overshoots.
 
+Optional measured-water and weather compensation adjusts partial heating demand
+at the start of each PWM cycle:
+
+```yaml
+thermozona:
+  thermal_compensation:
+    enabled: true
+    supply_sensor: sensor.heatpump_heating_out
+    reference_supply_c: 25.0
+    reference_outside_c: 10.0
+    max_sensor_age_minutes: 30
+    # Optional forecast in W/m², not PV electricity in W:
+    solar_forecast_sensor: sensor.outdoor_solar_forecast_2h
+    solar_gain_per_w_m2: 0.002
+```
+
+Use a sensor that measures water actually supplied to the room circuits, not the
+calculated flow setpoint or boiler temperature. Select references appropriate
+to the conditions for which the existing gains were tuned. The estimate compares
+outdoor heat loss (`room target - outside`) with water delivery
+(`measured supply - room`), relative to these references. Their combined factor
+is limited to 0.75–1.25. Hotter water reduces partial demand and colder weather
+increases it; hotter weather-compensated water counteracts the increased load.
+This trims the existing PI command, rather than adding a second weather curve:
+`trim = duty * (factor - 1) * (1 - duty / 100)`. Zero and 100% requests remain
+unchanged, so compensation cannot prevent an underheated room requesting full
+heat. PI integral limits and actuator timing still apply. Sensor updates do not
+restart cycles or introduce extra valve pulses.
+
+Missing, nonfinite, stale, non-Celsius or implausible water/weather readings
+retain ordinary PI control. Water outside 15–45°C, or less than 1°C warmer than
+the room, is unsuitable for this estimate. Freshness uses `last_reported` when
+available. Cooling and air-coil controls retain their existing behavior, and
+boiler priority and all existing interlocks remain authoritative. This is a
+bounded delivery/loss estimate, not a measured heat output or efficiency model.
+
+Climate diagnostics expose `pwm_thermal_factor`, `pwm_measured_supply_c`,
+`pwm_outside_c`, and `pwm_thermal_compensation` for the applied cycle.
+
+Startup platform holds, waiting for the first room reading, and boiler-priority pauses freeze the saved PI integral
+while keeping valves closed. Paused time is excluded from integration when
+control resumes. Explicit off and invalid room temperatures after the first valid reading still clear the
+integral. `pwm_integral_mode` records its heating/cooling direction; changing
+direction resets the integral and starts a fresh PWM cycle.
+
+An optional `solar_forecast_sensor` can soften partial PWM heating when the room
+is within 0.3°C of comfort. It uses the existing `zone_solar_weight` (zero means
+shaded) and `solar_gain_per_w_m2`, capped at a 1°C equivalent reduction in outdoor
+load, within the same overall factor bounds. Full heat demand stays intact.
+Forecast readings must be finite, 0–1500 W/m², in `W/m²` or `W/m2`, and reported
+within three hours. Invalid/missing forecasts leave water/weather correction
+available. The central solar forecast continues to soften its cold-weather
+preheat boost. These are forecast-based estimates of exposure, not measurements
+of sunlight entering each room. Diagnostics expose `pwm_solar_forecast_w_m2` and
+`pwm_solar_correction_c`.
+
 For a shared heat pump with small zone loads, staggered pulses can keep circulation active nearly continuously. Set `pwm_staggering: false` at the `thermozona` level and use a common `pwm_cycle_time` (for example, 30 minutes) to open demanding zones together. Each zone retains its own PI duty and on-time; grouping does not increase room targets or force satisfied zones open. `demand_off_delay_minutes: 0` also removes the additional demand hold after all circuits close. These options apply to both heating and cooling; existing mode, sensor, hot-water and dew-point interlocks still apply. They do not force a compressor minimum runtime or override native circulation settings. Check actual compressor cycles and room comfort after changing them.
 
 Example:
@@ -469,6 +526,22 @@ Climate attributes expose `recovery_start`, `recovery_ready_at`,
 `recovery_active`, `recovery_capped`, `recovery_source`,
 `heating_rate_c_per_hour`, sample/day counts and `recovery_waiting_for_boiler`.
 An unavailable recorder leaves bounded fallback recovery available.
+
+When thermal compensation is enabled, warming observations also retain the
+time-weighted supply, outdoor and room temperatures of the selected conservative
+rate. Recovery compares current conditions with that observed reference and
+adjusts estimated warming duration by the same bounded factor, before adding
+the safety buffer and enforcing the existing maximum lead time. A learned rate
+without usable historical conditions remains unadjusted; fallback durations use
+the configured references. `recovery_thermal_factor`,
+`recovery_thermal_compensation`, `heating_rate_reference_supply_c` and
+`heating_rate_reference_outside_c` expose the estimate. Once recovery has started,
+its start remains latched until that schedule period ends.
+For sun-exposed zones with a configured solar forecast, learning rejects windows
+above 150 W/m² times zone exposure, and windows with missing solar history. This
+avoids crediting expected solar warming entirely to water heating. The forecast
+alone never shortens scheduled recovery; missing learning data retains the
+bounded fallback estimate.
 
 ## Reloading YAML
 

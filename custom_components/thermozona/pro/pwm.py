@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 
 from homeassistant.components.climate import HVACMode
 
+from ..thermal_conditions import compensate_duty
+
 
 def get_aligned_pwm_cycle_start(
     *,
@@ -39,6 +41,7 @@ def calculate_pwm_duty(
     pwm_integral: float,
     pwm_kp: float,
     pwm_ki: float,
+    thermal_factor: float = 1.0,
 ) -> tuple[float, float, datetime]:
     """Calculate PI duty cycle percentage and return updated state."""
     error = target_temperature - current_temp
@@ -57,7 +60,7 @@ def calculate_pwm_duty(
 
     p_output = pwm_kp * error
     i_output = pwm_ki * updated_integral
-    duty_cycle = max(0.0, min(100.0, p_output + i_output))
+    duty_cycle = compensate_duty(p_output + i_output, thermal_factor)
     return duty_cycle, updated_integral, now
 
 

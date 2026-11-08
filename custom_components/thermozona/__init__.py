@@ -143,6 +143,7 @@ CONF_HYSTERESIS = "hysteresis"
 CONF_SETBACK_SCHEDULE = "setback_schedule"
 CONF_SETBACK_C = "setback_c"
 CONF_SCHEDULE_RECOVERY = "schedule_recovery"
+CONF_THERMAL_COMPENSATION = "thermal_compensation"
 
 DEFAULT_CONTROL_MODE = CONTROL_MODE_BANG_BANG
 DEFAULT_PWM_CYCLE_TIME = 15
@@ -293,6 +294,30 @@ RECOVERY_SCHEMA = vol.All(vol.Schema({
     vol.Optional("buffer_minutes", default=15): vol.All(vol.Coerce(int), vol.Range(min=5, max=60)),
     vol.Optional("history_days", default=7): vol.All(vol.Coerce(int), vol.Range(min=2, max=14)),
 }), _validate_recovery)
+
+
+def _validate_thermal_compensation(config: dict) -> dict:
+    """Require a measured sensor before opting in to water/weather correction."""
+    if config["enabled"] and not config.get("supply_sensor"):
+        raise vol.Invalid("Enabled thermal_compensation requires supply_sensor")
+    if config["reference_supply_c"] <= 20:
+        raise vol.Invalid("reference_supply_c must exceed a normal room temperature")
+    return config
+
+
+THERMAL_COMPENSATION_SCHEMA = vol.All(vol.Schema({
+    vol.Optional("enabled", default=False): cv.boolean,
+    vol.Optional("supply_sensor"): cv.entity_id,
+    vol.Optional("reference_supply_c", default=25.0): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=21, max=40)),
+    vol.Optional("reference_outside_c", default=10.0): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=-20, max=20)),
+    vol.Optional("max_sensor_age_minutes", default=30): vol.All(
+        vol.Coerce(int), vol.Range(min=5, max=120)),
+    vol.Optional("solar_forecast_sensor"): cv.entity_id,
+    vol.Optional("solar_gain_per_w_m2", default=0.002): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=0, max=0.01)),
+}), _validate_thermal_compensation)
 
 
 ZONE_SCHEMA = vol.Schema(
@@ -491,6 +516,7 @@ CONFIG_SCHEMA = vol.Schema({
         ): FLOW_SCHEMA,
         vol.Optional(CONF_PRICE_CHARGING, default={}): PRICE_CHARGING_SCHEMA,
         vol.Optional(CONF_HOT_WATER): HOT_WATER_SCHEMA,
+        vol.Optional(CONF_THERMAL_COMPENSATION, default={}): THERMAL_COMPENSATION_SCHEMA,
         vol.Required(CONF_ZONES): {
             cv.string: ZONE_SCHEMA
         }

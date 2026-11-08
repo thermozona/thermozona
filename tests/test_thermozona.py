@@ -1087,6 +1087,182 @@ def test_pwm_pi_output_is_clamped(fake_hass):
     assert duty == 100
 
 
+def _thermal_test_controller(fake_hass, now):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode",
+        thermal_compensation={"enabled": True, "supply_sensor": "sensor.water"}))
+    for entity, value in [("sensor.mode", "heat"), ("sensor.outside", "10"),
+                          ("sensor.water", "26"), ("sensor.living", "19.5")]:
+        fake_hass.states.set(entity, value)
+        fake_hass.states.get(entity).last_reported = now
+    return controller
+
+
+def test_pwm_uses_measured_water_and_outside_but_retains_full_output(fake_hass):
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    warmer = zone._calculate_pwm_duty(19.5, HVACMode.HEAT, now)
+    assert zone._pwm_thermal.reason == "active"
+    assert zone.extra_state_attributes["pwm_measured_supply_c"] == 26
+    zone._reset_pwm_state(True)
+    fake_hass.states.set("sensor.outside", "0")
+    fake_hass.states.get("sensor.outside").last_reported = now
+    colder = zone._calculate_pwm_duty(19.5, HVACMode.HEAT, now)
+    assert colder > warmer
+    zone._pwm_integral = 50
+    assert zone._calculate_pwm_duty(19.5, HVACMode.HEAT, now) == 100
+
+
+def test_pwm_cooling_does_not_use_heating_compensation(fake_hass):
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    duty = zone._calculate_pwm_duty(20.5, HVACMode.COOL, now)
+    assert duty == 16
+    assert zone._pwm_thermal.factor == 1
+    assert zone._pwm_thermal.reason == "not_space_heating"
+
+
+@pytest.mark.asyncio
+async def test_pwm_water_changes_do_not_restart_the_aligned_cycle(fake_hass, monkeypatch):
+    from custom_components.thermozona import thermostat as module
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(module, "datetime", SimpleNamespace(now=lambda _tz: now))
+    controller = _thermal_test_controller(fake_hass, now)
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    fake_hass.states.set("sensor.zone_pwm", "19.5")
+    fake_hass.states.set("switch.zone_pwm", "off")
+    await zone._control_heating()
+    before = (zone._pwm_cycle_start, zone._pwm_on_time, zone._pwm_integral)
+    fake_hass.states.set("sensor.water", "30")
+    fake_hass.states.get("sensor.water").last_reported = now
+    await zone._control_heating()
+    assert (zone._pwm_cycle_start, zone._pwm_on_time, zone._pwm_integral) == before
+    await controller.async_shutdown()
+
+
+def test_solar_forecast_trims_only_near_comfort_and_respects_zone_exposure(fake_hass):
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    controller._entry_config["thermal_compensation"]["solar_forecast_sensor"] = "sensor.solar"
+    fake_hass.states.set("sensor.solar", "500")
+    fake_hass.states.get("sensor.solar").last_reported = now
+    fake_hass.states.get("sensor.solar").attributes = {"unit_of_measurement": "W/m2"}
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    shaded = _create_pwm_thermostat(fake_hass, controller)
+    shaded._zone_solar_weight = 0
+    assert zone._calculate_pwm_duty(19.8, HVACMode.HEAT, now) < shaded._calculate_pwm_duty(19.8, HVACMode.HEAT, now)
+    assert zone._pwm_thermal.solar_w_m2 == 500
+    zone._reset_pwm_state(True)
+    shaded._reset_pwm_state(True)
+    assert zone._calculate_pwm_duty(19, HVACMode.HEAT, now) == shaded._calculate_pwm_duty(19, HVACMode.HEAT, now)
+    assert zone._pwm_thermal.solar_w_m2 is None
+
+
+def test_recovery_compares_current_conditions_with_observed_reference(fake_hass):
+    from custom_components.thermozona.room_recovery import HeatingRate
+    from custom_components.thermozona.thermal_conditions import ThermalReference
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    zone = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work",
+        schedule_recovery={"enabled": True})
+    zone._recovery.profile = HeatingRate(.4, 4, 2, ThermalReference(25, 10, 20))
+    assert zone._recovery_compensation().factor < 1
+    zone._recovery.profile = HeatingRate(.4, 4, 2)
+    assert zone._recovery_compensation().reason == "unreferenced_history"
+    zone._manual_mode = HVACMode.OFF
+    assert zone._recovery_compensation().factor == 1
+
+
+@pytest.mark.asyncio
+async def test_thermal_compensation_does_not_override_boiler_priority(fake_hass):
+    from custom_components.thermozona.hot_water import HotWaterManager
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    controller.hot_water = HotWaterManager(fake_hass, {"demand_entity": "input_boolean.dhw"})
+    fake_hass.states.set("input_boolean.dhw", "on")
+    fake_hass.states.set("switch.zone_1", "on")
+    zone = _create_thermostat(fake_hass, controller, control_mode="pwm")
+    assert controller.thermal_compensation(room_c=19, target_c=20, now=now).reason == "boiler_priority"
+    await zone._control_heating()
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    assert zone._pwm_thermal.factor == 1
+    await controller.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_startup_hold_preserves_restored_integral_until_platforms_are_ready(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("sensor.living", "19.5")
+    fake_hass.states.set("switch.zone_1", "off")
+    controller.begin_platform_setup()
+    zone = _create_thermostat(fake_hass, controller, control_mode="pwm")
+    zone.async_get_last_state = AsyncMock(return_value=SimpleNamespace(state="auto",
+        attributes={"temperature": 20, "pwm_integral": 40, "pwm_integral_mode": "heat"}))
+    await zone.async_added_to_hass()
+    await zone._control_heating()
+    assert zone._pwm_integral == 40
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    controller._flow_output_ready = True
+    await zone._control_heating()
+    assert zone._pwm_duty_cycle > 80
+    assert zone._pwm_integral >= 40
+    await controller.async_shutdown()
+    await zone.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_startup_waits_for_first_room_reading_without_losing_integral(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("switch.zone_1", "off")
+    zone = _create_thermostat(fake_hass, controller, control_mode="pwm")
+    zone._pwm_integral = 40
+    zone._pwm_integral_mode = HVACMode.HEAT
+    await zone._control_heating()
+    assert zone._pwm_integral == 40
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    fake_hass.states.set("sensor.living", "19.5")
+    await zone._control_heating()
+    assert zone._pwm_integral >= 40
+    fake_hass.states.set("sensor.living", "unavailable")
+    await zone._control_heating()
+    assert zone._pwm_integral == 0
+    await controller.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_boiler_pause_freezes_integral_and_excludes_pause_time(fake_hass):
+    from custom_components.thermozona.hot_water import HotWaterManager
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    controller.hot_water = HotWaterManager(fake_hass, {"demand_entity": "input_boolean.dhw"})
+    fake_hass.states.set("input_boolean.dhw", "on")
+    fake_hass.states.set("switch.zone_1", "on")
+    zone = _create_thermostat(fake_hass, controller, control_mode="pwm")
+    zone._pwm_integral = 20
+    zone._pwm_integral_mode = HVACMode.HEAT
+    zone._last_control_time = now-timedelta(hours=2)
+    await zone._control_heating()
+    assert zone._pwm_integral == 20
+    assert zone._last_control_time is None
+    fake_hass.states.set("input_boolean.dhw", "off")
+    await zone._control_heating()
+    assert zone._pwm_integral == pytest.approx(20.5)
+    await controller.async_shutdown()
+
+
+def test_integral_is_reset_on_real_heating_cooling_direction_change(fake_hass):
+    controller = HeatPumpController(fake_hass, _config())
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    zone._pwm_integral = 50
+    zone._pwm_integral_mode = HVACMode.HEAT
+    duty = zone._calculate_pwm_duty(20.5, HVACMode.COOL, datetime.now(timezone.utc))
+    assert duty == 16
+    assert zone._pwm_integral_mode == HVACMode.COOL
+
+
 def test_pwm_cycle_applies_minimum_times(fake_hass):
     controller = HeatPumpController(fake_hass, _config())
     thermostat = _create_pwm_thermostat(fake_hass, controller)

@@ -10,6 +10,7 @@ import math
 from typing import Any
 
 from .price_charging import PriceSlot, average_price
+from .thermal_conditions import ThermalReference
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +22,28 @@ class HeatingRate:
     rate: float | None = None
     samples: int = 0
     days: int = 0
+    reference: ThermalReference | None = None
+
+
+def _average_condition(
+    rows: Sequence[tuple[datetime, float | None]], times: list[datetime],
+    start: datetime, end: datetime,
+) -> float | None:
+    """Time-weight history, rejecting unavailable values and long recording gaps."""
+    index = bisect_right(times, start) - 1
+    if index < 0:
+        return None
+    selected = rows[index:bisect_right(times, end)]
+    total = 0.0
+    cursor = start
+    for (stamp, value), right in zip(selected, [*times[index + 1:bisect_right(times, end)], end]):
+        right = min(right, end)
+        if (value is None or not math.isfinite(value)
+                or right - stamp > timedelta(hours=2)):
+            return None
+        total += value * (right - cursor).total_seconds()
+        cursor = right
+    return total / (end - start).total_seconds()
 
 
 def overlap_seconds(
@@ -41,12 +64,22 @@ def overlap_seconds(
 def learn_heating_rate(
     temperatures: Sequence[tuple[datetime, float | None]],
     heating_intervals: Sequence[tuple[datetime, datetime]],
+    supply_temperatures: Sequence[tuple[datetime, float | None]] = (),
+    outside_temperatures: Sequence[tuple[datetime, float | None]] = (),
+    solar_forecasts: Sequence[tuple[datetime, float | None]] | None = None,
+    solar_weight: float = 0.0,
 ) -> HeatingRate:
     """Use lower-quartile hourly rises with >=20 minutes of heating on >=2 days."""
     rows = sorted(temperatures, key=lambda row: row[0])
     if len(rows) < 2:
         return HeatingRate()
     times = [t for t, _ in rows]
+    supply_rows = sorted(supply_temperatures)
+    outside_rows = sorted(outside_temperatures)
+    supply_times = [t for t, _ in supply_rows]
+    outside_times = [t for t, _ in outside_rows]
+    solar_rows = sorted(solar_forecasts or ())
+    solar_times = [t for t, _ in solar_rows]
     cursor = rows[0][0]
     rates = []
     days = set()
@@ -68,20 +101,35 @@ def learn_heating_rate(
             hours = (rows[b][0] - rows[a][0]).total_seconds() / 3600
             rise = (rows[b][1] - rows[a][1]) / hours
             if 0.05 <= rise <= 2.0:
-                rates.append(rise)
+                solar = _average_condition(solar_rows, solar_times, cursor, end)
+                if (solar_weight > 0 and solar_forecasts is not None
+                        and (solar is None or not 0 <= solar <= 1500 or solar * solar_weight > 150)):
+                    cursor += timedelta(minutes=30)
+                    continue
+                supply = _average_condition(supply_rows, supply_times, cursor, end)
+                outside = _average_condition(outside_rows, outside_times, cursor, end)
+                room = (rows[a][1] + rows[b][1]) / 2
+                reference = None
+                if (supply is not None and outside is not None and 15 <= supply <= 45
+                        and -40 <= outside <= 50 and supply - room >= 1):
+                    reference = ThermalReference(supply, outside, room)
+                rates.append((rise, reference))
                 days.add(cursor.date())
                 observed.append(cursor)
         cursor += timedelta(minutes=30)
     if (len(rates) < 3 or len(days) < 2
             or observed[-1] - observed[0] < timedelta(hours=12)):
         return HeatingRate(samples=len(rates), days=len(days))
-    rates.sort()
-    return HeatingRate(rates[int((len(rates) - 1) * 0.25)], len(rates), len(days))
+    rates.sort(key=lambda row: row[0])
+    rate, reference = rates[int((len(rates) - 1) * 0.25)]
+    return HeatingRate(rate, len(rates), len(days), reference)
 
 
 async def async_heating_rate(
     hass, temperature_sensor: str, circuits: list[str], status_sensor: str,
     now: datetime, days: int,
+    supply_sensor: str | None = None, outside_sensor: str | None = None,
+    solar_sensor: str | None = None, solar_weight: float = 0.0,
 ) -> HeatingRate:
     """Read and process recorder history in its executor, without direct database access."""
     from homeassistant.components.recorder import get_instance
@@ -89,17 +137,23 @@ async def async_heating_rate(
 
     def read_and_learn() -> HeatingRate:
         start = now - timedelta(days=days)
+        entity_ids = list(dict.fromkeys(
+            entity for entity in [temperature_sensor, *circuits, status_sensor,
+                                  supply_sensor, outside_sensor, solar_sensor] if entity
+        ))
         history = get_significant_states(
-            hass, start, now, entity_ids=[temperature_sensor, *circuits, status_sensor],
+            hass, start, now, entity_ids=entity_ids,
             no_attributes=True,
         )
-        temperatures = []
-        for state in history.get(temperature_sensor, []):
-            try:
-                value = float(state.state)
-            except (ValueError, TypeError):
-                value = None
-            temperatures.append((max(start, state.last_updated), value))
+        def temperatures(entity: str | None) -> list[tuple[datetime, float | None]]:
+            result = []
+            for state in history.get(entity, []):
+                try:
+                    value = float(state.state)
+                except (ValueError, TypeError):
+                    value = None
+                result.append((max(start, state.last_updated), value))
+            return result
         events = sorted(
             (max(start, state.last_updated), entity, state.state)
             for entity in [*circuits, status_sensor] for state in history.get(entity, [])
@@ -113,7 +167,11 @@ async def async_heating_rate(
                     intervals.append((previous, timestamp))
             states[entity] = state
             previous = timestamp
-        return learn_heating_rate(temperatures, intervals)
+        return learn_heating_rate(
+            temperatures(temperature_sensor), intervals,
+            temperatures(supply_sensor), temperatures(outside_sensor),
+            temperatures(solar_sensor) if solar_sensor else None, solar_weight,
+        )
 
     return await get_instance(hass).async_add_executor_job(read_and_learn)
 
@@ -148,12 +206,18 @@ class RoomRecovery:
             self.last_attempt is not None and now-self.last_attempt < timedelta(minutes=15)
         )
 
-    async def async_learn(self, hass, sensor, circuits, status, now: datetime) -> None:
+    async def async_learn(
+        self, hass, sensor, circuits, status, now: datetime,
+        supply_sensor: str | None = None, outside_sensor: str | None = None,
+        solar_sensor: str | None = None, solar_weight: float = 0.0,
+    ) -> None:
         """Only learn through the recorder API; normal control continues meanwhile."""
         self.last_attempt = now
         try:
             self.profile = await async_heating_rate(
-                hass, sensor, circuits, status, now, self.config.get("history_days", 7)
+                hass, sensor, circuits, status, now, self.config.get("history_days", 7),
+                supply_sensor, outside_sensor,
+                solar_sensor, solar_weight,
             )
             self.last_learning = now
             self.error = None
@@ -166,7 +230,8 @@ class RoomRecovery:
     def plan(self, *, now: datetime, schedule_on: bool, ready_at: Any,
              current: float | None, target: float, setback: float, enabled: bool,
              cycle_minutes: int = 0, prices: list[PriceSlot] | None = None,
-             blocked_windows: Sequence[tuple[datetime, datetime]] | None = None) -> RecoveryPlan:
+             blocked_windows: Sequence[tuple[datetime, datetime]] | None = None,
+             thermal_factor: float = 1.0) -> RecoveryPlan:
         """Restore comfort early, allowing boiler time and modest cheaper-hour shifts."""
         try:
             if isinstance(ready_at, str):
@@ -189,7 +254,7 @@ class RoomRecovery:
         base_minutes = (
             deficit / rate * 60 if rate else
             self.config.get("fallback_minutes", 120) * deficit / max(setback, 0.1)
-        ) + self.config.get("buffer_minutes", 15)
+        ) * thermal_factor + self.config.get("buffer_minutes", 15)
         maximum = self.config.get("max_minutes", 180)
         capped = base_minutes > maximum
         minutes = min(maximum, base_minutes)

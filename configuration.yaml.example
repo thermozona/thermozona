@@ -56,6 +56,15 @@ input_boolean:
 # Thermozona configuratie
 # Safety notice: Use at your own risk; ensure code-compliant installation/wiring. Authors/contributors are not liable for damage, injury, or fire.
 thermozona:
+  # Optional bounded heating correction from actual supply water and weather.
+  # thermal_compensation:
+  #   enabled: true
+  #   supply_sensor: sensor.heatpump_heating_out
+  #   reference_supply_c: 25.0
+  #   reference_outside_c: 10.0
+  #   max_sensor_age_minutes: 30
+  #   solar_forecast_sensor: sensor.outdoor_solar_forecast_2h
+  #   solar_gain_per_w_m2: 0.002
   outside_temp_sensor: sensor.test_buiten_temperatuur
   # heating_base_offset: 3.0
   # weather_slope_heat: 0.25
