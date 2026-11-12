@@ -53,12 +53,18 @@ def calculate_pwm_duty(
     else:
         dt_minutes = max((now - last_control_time).total_seconds() / 60, 1.0)
 
+    p_output = pwm_kp * error
     updated_integral = pwm_integral + (error * dt_minutes)
     if pwm_ki != 0:
         limit = 100 / abs(pwm_ki)
         updated_integral = max(-limit, min(limit, updated_integral))
+        previous_integral = max(-limit, min(limit, pwm_integral))
+        candidate_output = p_output + pwm_ki * updated_integral
+        integral_change = pwm_ki * (updated_integral - previous_integral)
+        if ((candidate_output > 100 and integral_change > 0)
+                or (candidate_output < 0 and integral_change < 0)):
+            updated_integral = previous_integral
 
-    p_output = pwm_kp * error
     i_output = pwm_ki * updated_integral
     duty_cycle = compensate_duty(p_output + i_output, thermal_factor)
     return duty_cycle, updated_integral, now
@@ -92,6 +98,12 @@ def calculate_on_time_minutes(
     if on_minutes > 0:
         on_minutes += actuator_delay_minutes
         on_minutes = min(on_minutes, float(cycle_time_minutes))
+
+    # Actuator compensation must retain the off interval of a partial request.
+    if 0 < duty_cycle <= 95:
+        on_minutes = min(on_minutes, max(0.0, cycle_time_minutes - min_off_time_minutes))
+        if 0 < on_minutes < min_on_time_minutes:
+            on_minutes = 0.0
 
     return on_minutes
 

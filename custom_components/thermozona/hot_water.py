@@ -10,6 +10,12 @@ from typing import Any
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.event import async_track_state_change_event
 
+from . import (
+    CONF_HOT_WATER_HEATING_ACTIVE_SENSOR,
+    CONF_HOT_WATER_START_DIFFERENTIAL_SENSOR,
+    CONF_HOT_WATER_START_TIMEOUT_MINUTES,
+    DEFAULT_HOT_WATER_START_TIMEOUT_MINUTES,
+)
 from .price_charging import ChargeWindow, PriceChargingManager, PriceSlot, average_price
 from .thermal_planning import (
     UsageProfile, async_temperature_history, estimate_heat_cost, infer_usage_profile,
@@ -37,6 +43,8 @@ class HotWaterManager(PriceChargingManager):
         self._history_attempt: datetime | None = None
         self._usage_error = None
         self._active_target: float | None = None
+        self._heating_confirmed = False
+        self._start_failure_until: datetime | None = None
 
     @property
     def _time_zone(self) -> str:
@@ -97,13 +105,20 @@ class HotWaterManager(PriceChargingManager):
                     best = candidate
         return best
 
+    def _activity_entities(self) -> list[str]:
+        """Include native verification feedback in boiler-priority interlocks."""
+        entities = list(self._config.get("active_sensors", []))
+        if entity := self._config.get(CONF_HOT_WATER_HEATING_ACTIVE_SENSOR):
+            entities.append(entity)
+        return list(dict.fromkeys(entities))
+
     @property
     def blocks_space_heating(self) -> bool:
         """Keep the shared heat pump available to requested or native water heating."""
         demand = self._state("demand_entity")
         if self._owned or demand is None or demand.state != "off":
             return True
-        for entity_id in self._config.get("active_sensors", []):
+        for entity_id in self._activity_entities():
             state = self._hass.states.get(entity_id)
             if state is None or state.state not in {"off", "0", "0.0"}:
                 return True
@@ -117,9 +132,13 @@ class HotWaterManager(PriceChargingManager):
 
     async def async_start(self) -> None:
         """React immediately to native heat-pump and request state changes."""
+        entities = [self._config["demand_entity"], self._config["temperature_sensor"],
+                    *self._activity_entities()]
+        if self._smart and (entity := self._smart.get(CONF_HOT_WATER_START_DIFFERENTIAL_SENSOR)):
+            entities.append(entity)
         self._remove_state_listener = async_track_state_change_event(
             self._hass,
-            [self._config["demand_entity"], self._config["temperature_sensor"], *self._config.get("active_sensors", [])],
+            list(dict.fromkeys(entities)),
             self._async_demand_changed,
         )
         await super().async_start()
@@ -147,6 +166,24 @@ class HotWaterManager(PriceChargingManager):
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
 
+    def _start_target(self, target: float, temperature: float) -> tuple[float | None, str | None]:
+        """Cross native startup hysteresis without exceeding the configured limit."""
+        if self._smart is None or not self._smart.get(CONF_HOT_WATER_START_DIFFERENTIAL_SENSOR):
+            return target, None
+        state = self._hass.states.get(self._smart[CONF_HOT_WATER_START_DIFFERENTIAL_SENSOR])
+        try:
+            differential = float(state.state)
+            unit = getattr(state, "attributes", {}).get("unit_of_measurement", "°C")
+        except (AttributeError, TypeError, ValueError):
+            return None, "start_conditions_unavailable"
+        if not math.isfinite(differential) or not 0 <= differential <= 20 or unit != "°C":
+            return None, "start_conditions_unavailable"
+        required = math.ceil((temperature + differential + 0.5) * 2) / 2
+        target = max(target, required)
+        if target > self._smart.get("max_temperature", 55):
+            return None, "waiting_for_start_threshold"
+        return target, None
+
     @property
     def state(self) -> str:
         return self._reason
@@ -158,6 +195,10 @@ class HotWaterManager(PriceChargingManager):
             "temperature": self._number("temperature_sensor"),
             "soc": self._number("soc_sensor"),
             "request_owned": self._owned,
+            "heating_confirmed": self._heating_confirmed if self._config.get(
+                CONF_HOT_WATER_HEATING_ACTIVE_SENSOR
+            ) else None,
+            "request_started_at": None if self._requested_at is None else self._requested_at.isoformat(),
             "space_heating_blocked": self.blocks_space_heating,
             "charge_start": None if self.window is None else self.window.start.isoformat(),
             "charge_end": None if self.window is None else self.window.end.isoformat(),
@@ -201,12 +242,16 @@ class HotWaterManager(PriceChargingManager):
         )
         self._owned = False
         self._active_target = None
+        self._requested_at = None
+        self._heating_confirmed = False
 
     async def async_set_mode(self, mode: str) -> None:
         if mode not in {"off", "monitor", "auto"}:
             raise ValueError(f"Invalid hot-water mode: {mode}")
         if mode != "auto":
             await self._release()
+        self._start_failure_until = None
+        self.error = None
         self.mode = mode
         await self.async_refresh()
 
@@ -224,6 +269,9 @@ class HotWaterManager(PriceChargingManager):
                 return
             now = datetime.now(timezone.utc)
             try:
+                if self._start_failure_until is not None and now >= self._start_failure_until:
+                    self._start_failure_until = None
+                    self.error = None
                 if self.mode == "off":
                     self._reason = "off"
                     self._notify()
@@ -264,6 +312,9 @@ class HotWaterManager(PriceChargingManager):
                             self._active_target = float(state.state)
                         except (AttributeError, ValueError, TypeError):
                             self._active_target = None
+                if self._owned and self._requested_at is None:
+                    age = runtime if runtime is not None and 0 <= runtime < 5400 else 0
+                    self._requested_at = now - timedelta(seconds=age)
                 if self._requested_at is not None and (
                     runtime is None or runtime > (now-self._requested_at).total_seconds()+60
                 ):
@@ -281,6 +332,14 @@ class HotWaterManager(PriceChargingManager):
                     self._import_since = None
                 solar = self._surplus_since is not None and (now-self._surplus_since).total_seconds() >= 300
                 if self._owned:
+                    heating_entity = self._config.get(CONF_HOT_WATER_HEATING_ACTIVE_SENSOR)
+                    heating = self._hass.states.get(heating_entity) if heating_entity else None
+                    if heating is not None and heating.state in {"on", "1", "1.0"}:
+                        self._heating_confirmed = True
+                    timeout = self._config.get(CONF_HOT_WATER_START_TIMEOUT_MINUTES,
+                                               DEFAULT_HOT_WATER_START_TIMEOUT_MINUTES)
+                    start_failed = (heating_entity is not None and not self._heating_confirmed
+                                    and (now - self._requested_at).total_seconds() >= timeout * 60)
                     is_solar = source is not None and source.state == "solar"
                     expired = not in_window or not slots
                     if is_solar:
@@ -291,12 +350,21 @@ class HotWaterManager(PriceChargingManager):
                     )
                     stop = (demand is None or demand.state != "on" or not valid or not target_valid or (soc is not None and soc >= 99) or (temperature is not None and target_valid and temperature >= target) or
                             expired or
-                            runtime is None or runtime >= 5400)
+                            runtime is None or runtime >= 5400 or start_failed)
                     if stop:
                         await self._release()
-                    self._reason = "heating" if self._owned else "idle"
+                    if start_failed:
+                        self._start_failure_until = self.window.end if in_window else now + timedelta(hours=1)
+                        self._reason = "start_failed"
+                        _LOGGER.warning("Hot-water heating did not start within %s minutes; releasing request", timeout)
+                    elif self._owned:
+                        self._reason = "waiting_for_start" if heating_entity and not self._heating_confirmed else "heating"
+                    else:
+                        self._reason = "idle"
                 elif self.mode == "monitor":
                     self._reason = "monitor"
+                elif self._start_failure_until is not None and now < self._start_failure_until:
+                    self._reason = "start_failed"
                 elif not valid or not slots:
                     self._reason = "unavailable"
                 elif source is None or source.state != "none" or demand is None or demand.state != "off":
@@ -312,13 +380,24 @@ class HotWaterManager(PriceChargingManager):
                                     self._smart.get("normal_temperature", 50) + period.drop_c)
                         native_idle = all(
                             (state := self._hass.states.get(e)) is not None and state.state in {"off", "0", "0.0"}
-                            for e in self._config.get("active_sensors", [])
+                            for e in self._activity_entities()
                         )
                         should_start = native_idle and target is not None and temperature < target - 0.5 and (solar or in_window)
                     else:
                         should_start = (solar and soc < 99) or (in_window and soc < 40)
                     if should_start and elapsed is not None and elapsed > 14400:
+                        heating_entity = self._config.get(CONF_HOT_WATER_HEATING_ACTIVE_SENSOR)
+                        heating = self._hass.states.get(heating_entity) if heating_entity else None
+                        if heating_entity and (heating is None or heating.state not in {"off", "0", "0.0"}):
+                            self._reason = "start_conditions_unavailable"
+                            self._notify()
+                            return
                         if self._smart is not None:
+                            target, reason = self._start_target(target, temperature)
+                            if target is None:
+                                self._reason = reason
+                                self._notify()
+                                return
                             entity = self._smart["target_entity"]
                             state = self._hass.states.get(entity)
                             if state is None or state.state in {"unknown", "unavailable"}:
@@ -334,6 +413,7 @@ class HotWaterManager(PriceChargingManager):
                         )
                         self._owned = True
                         self._requested_at = now
+                        self._heating_confirmed = False
                         await self._gateway(True)
                         self._reason = "requested"
                     else:
@@ -341,7 +421,8 @@ class HotWaterManager(PriceChargingManager):
                             "learning_usage" if self._smart is not None and not self._usage.periods else
                             "no_economic_window" if self._smart is not None else "unavailable"
                         )
-                self.error = self._prices.error
+                self.error = ("heating_not_started" if self._start_failure_until is not None
+                              and now < self._start_failure_until else self._prices.error)
             except Exception as err:
                 self.error = "gateway_or_data_error"
                 self._reason = "error"

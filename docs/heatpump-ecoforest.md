@@ -2,7 +2,11 @@
 
 This guide shows how to pair an Ecoforest heat pump with Thermozona using Home Assistant's Modbus integration. Adapt the IP address, slave IDs, and register ranges to match your own unit.
 
-For a complete coordinated mode/setpoint automation, use [ecoforest-demand.yaml](ecoforest-demand.yaml) instead of the separate illustrative automations below. It checks active commands, stops before changing direction, writes the setpoint before enabling demand, and reconciles readback every five minutes. Its state triggers ignore diagnostic attribute updates and explicitly watch `command_active` and `effective_mode`; this prevents routine diagnostic updates from filling the Modbus automation queue.
+For a complete coordinated mode/setpoint automation, use [ecoforest-demand.yaml](ecoforest-demand.yaml) instead of the separate illustrative automations below. It checks active commands, stops before changing direction, writes the setpoint before enabling demand, and reconciles readback at Home Assistant startup and every five minutes. Its state triggers ignore diagnostic attribute updates and explicitly watch `command_active` and `effective_mode`; this prevents routine diagnostic updates from filling the Modbus automation queue.
+
+The automation allows ten queued runs so coincident demand, flow, mode and timer
+triggers can reconcile without dropping the fourth trigger during a transition.
+Each queued run reads the current controller state before writing.
 
 > Safety notice: This setup is used at your own risk. You are responsible for safe installation and code-compliant wiring/configuration; the project authors and contributors are not liable for damage, injury, equipment failure, or fire.
 

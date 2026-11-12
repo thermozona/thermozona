@@ -3,8 +3,10 @@ automation:
   - alias: "Drive Ecoforest mode and setpoint from Thermozona"
     description: "Synchronize demand and setpoint; stop before changing direction."
     mode: queued
-    max: 3
+    max: 10
     trigger:
+      - platform: homeassistant
+        event: start
       - platform: state
         entity_id:
           - sensor.thermozona_heat_pump_status

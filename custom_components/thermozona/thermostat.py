@@ -198,6 +198,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         self._pwm_integral = 0.0
         self._pwm_integral_mode: HVACMode | None = None
         self._pwm_duty_cycle = 0.0
+        self._pwm_comfort_limited = False
+        self._pwm_comfort_hold_until: datetime | None = None
         self._last_control_time: datetime | None = None
 
     async def async_added_to_hass(self) -> None:
@@ -364,6 +366,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             "recovery_waiting_for_boiler": recovery.active and self._controller.space_heating_suspended,
             "recovery_error": None if self._recovery is None else self._recovery.error,
             "pwm_duty_cycle": round(self._pwm_duty_cycle, 2),
+            "pwm_comfort_limited": self._pwm_comfort_limited,
             "pwm_thermal_factor": round(self._pwm_thermal.factor, 3),
             "pwm_measured_supply_c": self._pwm_thermal.supply_c,
             "pwm_outside_c": self._pwm_thermal.outside_c,
@@ -832,7 +835,25 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         cycle_start = self._get_aligned_pwm_cycle_start(now)
         active_before = self._circuits_are_active()
 
+        error = self.effective_target_temperature - current_temp
+        if effective_mode == HVACMode.COOL:
+            error = -error
+        if error < -self._hysteresis:
+            self._reset_pwm_state(reset_integral=True)
+            self._pwm_cycle_start = cycle_start
+            self._pwm_comfort_limited = True
+            self._pwm_comfort_hold_until = max(
+                cycle_start + timedelta(minutes=self._pwm_cycle_time_minutes),
+                now + timedelta(minutes=self._pwm_min_off_time_minutes),
+            )
+
+        if self._pwm_comfort_hold_until is not None and now < self._pwm_comfort_hold_until:
+            await self._set_circuits_state(False)
+            self._attr_hvac_action = HVACAction.IDLE
+            return
+
         if self._pwm_cycle_start != cycle_start:
+            resuming_after_limit = self._pwm_comfort_limited
             self._start_new_pwm_cycle(
                 current_temp=current_temp,
                 effective_mode=effective_mode,
@@ -840,6 +861,10 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
                 cycle_start=cycle_start,
                 was_active=active_before,
             )
+            remaining = (cycle_start + self._pwm_on_time - now).total_seconds()
+            if resuming_after_limit and remaining < self._pwm_min_on_time_minutes * 60:
+                self._pwm_on_time = timedelta()
+                self._pwm_duty_cycle = 0.0
 
         if self._pwm_cycle_start is None:
             return
@@ -867,6 +892,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         was_active: bool,
     ) -> None:
         """Start a new PWM cycle and compute duty from PI terms."""
+        self._pwm_comfort_limited = False
+        self._pwm_comfort_hold_until = None
         duty = self._calculate_pwm_duty(current_temp, effective_mode, now)
         on_minutes = calculate_on_time_minutes(
             duty_cycle=duty,
@@ -930,6 +957,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         self._pwm_cycle_start = None
         self._pwm_on_time = timedelta()
         self._pwm_duty_cycle = 0.0
+        self._pwm_comfort_limited = False
+        self._pwm_comfort_hold_until = None
         self._pwm_thermal = ThermalCompensation(reason="inactive")
         self._last_control_time = None
         if reset_integral:

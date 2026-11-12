@@ -8,13 +8,24 @@ class ThermozonaControlCard extends HTMLElement {
       this.shadowRoot.addEventListener("input", (event) => this._plannerInput(event));
       this.shadowRoot.addEventListener("change", (event) => this._plannerInput(event));
     }
+    if (config.view === "planner" && this._hass && !this._plannerOpen) {
+      this._openPlanner();
+      return;
+    }
     this._render();
   }
 
   set hass(hass) {
     this._hass = hass;
+    if (this._config?.view === "planner" && !this._plannerOpen) {
+      this._openPlanner();
+      return;
+    }
     // Keep an open editor stable while live temperatures and diagnostics update.
-    if (this._plannerOpen) return;
+    if (this._plannerOpen) {
+      if (!this._plannerRoom && this._rooms().length) this._openPlanner();
+      return;
+    }
     const entities = Object.entries(hass.states).filter(([id]) =>
       id.includes("thermozona") || id === "sensor.elektriciteitsprijs_actief" ||
       id.startsWith("schedule.") ||
@@ -73,8 +84,16 @@ class ThermozonaControlCard extends HTMLElement {
     else if (mode === "off") detail = "Uit · normaal comfort blijft actief";
     else {
       const phase = this._value(sensor);
-      const plan = phase === "learning_usage" ? "Leert je warmwatergebruik" :
-        !attrs.charge_start ? "Geen voordelig laadmoment" : this._window(attrs);
+      const boilerPhase = boiler && ({
+        requested: "Boilerstart aangevraagd",
+        waiting_for_start: "Wacht op start warmtepomp",
+        heating: "Boiler wordt opgewarmd",
+        start_failed: "Boiler niet gestart · laadvraag gestopt",
+        waiting_for_start_threshold: "Tank nog te warm om bij te laden",
+        start_conditions_unavailable: "Startgegevens ontbreken",
+      })[phase];
+      const plan = boilerPhase || (phase === "learning_usage" ? "Leert je warmwatergebruik" :
+        !attrs.charge_start ? "Geen voordelig laadmoment" : this._window(attrs));
       const target = boiler && attrs.target_temperature != null ? ` · tot ${this._number(attrs.target_temperature)} °C` : "";
       detail = `${mode === "auto" ? "" : "Alleen bekijken · "}${plan}${target}`;
     }
@@ -253,7 +272,7 @@ class ThermozonaControlCard extends HTMLElement {
       .planner-message{font-size:12px;line-height:18px;margin-top:10px;color:var(--primary-color,#03a9f4)}.planner-message.error{color:var(--error-color,#ef5350)}
       button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--primary-color,#03a9f4);outline-offset:2px}
     </style><ha-card>
-      <div class="heading"><h2>Ruimteplanning</h2><button class="close" data-action="planner-close" ${this._plannerSaving ? "disabled" : ""}>${this._plannerDirty ? "Annuleren" : "Sluiten"}</button></div>
+      <div class="heading"><h2>Ruimteplanning</h2>${this._config?.view === "planner" ? "" : `<button class="close" data-action="planner-close" ${this._plannerSaving ? "disabled" : ""}>${this._plannerDirty ? "Annuleren" : "Sluiten"}</button>`}</div>
       <p class="intro">Kies de uren waarop een kamer ${this._number(attrs.setback_c ?? 1)} °C koeler mag zijn. Thermozona plant de normale temperatuur voor het einde van zo’n periode.</p>
       <label>Kamer<select data-planner-room ${disabled ? "disabled" : ""}>${rooms.map((s) => `<option value="${s.entity_id}" ${s.entity_id === this._plannerRoom ? "selected" : ""}>${this._escape((s.attributes.friendly_name || s.entity_id).replace(/^Thermozona\s+/i, ""))}</option>`).join("")}</select></label>
       ${this._value(this._plannerRoom) === "off" ? '<p class="hint">Deze kamer staat uit. Het schema zet de kamer niet aan.</p>' : ""}

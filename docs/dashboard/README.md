@@ -26,6 +26,25 @@ Assistant's dashboard resources. Reload the frontend after adding or updating it
 type: custom:thermozona-control-card
 ```
 
+For a visible **Kamerschema’s** dashboard tab, add a view with the editor opened
+directly. The room selector lists every linked room, including rooms that are off.
+
+```yaml
+title: Kamerschema’s
+path: schemas
+icon: mdi:calendar-week
+type: sections
+max_columns: 1
+sections:
+  - type: grid
+    cards:
+      - type: custom:thermozona-control-card
+        view: planner
+```
+
+Empty weeks mean no cooler periods have been configured yet. Select a room and
+add its time blocks. Use **Wijzigingen verwerpen** to discard unsaved edits.
+
 The card uses the standard Thermozona entity IDs and the installation's
 `sensor.elektriciteitsprijs_actief` price sensor. Its navigation links target the
 Boiler and Detail views at `/dashboard-vloerverwarming/boiler` and

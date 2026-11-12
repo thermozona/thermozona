@@ -73,6 +73,10 @@ CONF_ZONE_SOLAR_WEIGHT = "zone_solar_weight"
 CONF_ZONE_TYPE = "zone_type"
 CONF_PRICE_CHARGING = "price_charging"
 CONF_HOT_WATER = "hot_water"
+CONF_HOT_WATER_START_DIFFERENTIAL_SENSOR = "start_differential_sensor"
+CONF_HOT_WATER_HEATING_ACTIVE_SENSOR = "heating_active_sensor"
+CONF_HOT_WATER_START_TIMEOUT_MINUTES = "start_timeout_minutes"
+DEFAULT_HOT_WATER_START_TIMEOUT_MINUTES = 10
 CONF_PRICE_MODE = "mode"
 CONF_PRICE_HOME = "home"
 CONF_PRICE_BOOST = "boost_c"
@@ -411,6 +415,7 @@ THERMAL_MODEL_SCHEMA = vol.Schema({
 
 SMART_HOT_WATER_SCHEMA = vol.Schema({
     vol.Required("target_entity"): cv.entity_id,
+    vol.Optional(CONF_HOT_WATER_START_DIFFERENTIAL_SENSOR): cv.entity_id,
     vol.Required("thermal_model"): THERMAL_MODEL_SCHEMA,
     vol.Optional("normal_temperature", default=50.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=45, max=65)),
     vol.Optional("max_temperature", default=55.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=45, max=65)),
@@ -460,6 +465,11 @@ HOT_WATER_SCHEMA = vol.Schema({
     )},
     vol.Optional("grid_sensor"): cv.entity_id,
     vol.Optional("active_sensors", default=[]): [cv.entity_id],
+    vol.Optional(CONF_HOT_WATER_HEATING_ACTIVE_SENSOR): cv.entity_id,
+    vol.Optional(
+        CONF_HOT_WATER_START_TIMEOUT_MINUTES,
+        default=DEFAULT_HOT_WATER_START_TIMEOUT_MINUTES,
+    ): vol.All(vol.Coerce(_finite_float), vol.Range(min=5, max=30)),
     vol.Required("start_service"): cv.string,
     vol.Required("stop_service"): cv.string,
     vol.Optional("start_data", default={}): dict,

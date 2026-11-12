@@ -89,6 +89,19 @@ thermozona:
   #     loss_percent_per_hour: 1.0
   #     min_saving_percent: 5
 
+  # Optional hot-water start checks (add the gateway options from README).
+  # hot_water:
+  #   heating_active_sensor: binary_sensor.heatpump_dhw_demand_internal
+  #   start_timeout_minutes: 10
+  #   smart_charging:
+  #     target_entity: input_number.hot_water_charge_target
+  #     start_differential_sensor: sensor.heatpump_delta_t_start_dhw
+  #     normal_temperature: 50
+  #     max_temperature: 55
+  #     thermal_model:
+  #       normal_cop: 3.0
+  #       charge_cop: 2.5
+
   # Optional flow calculation tuning.
   # Keep it small here; see README for the full tuning matrix.
   flow:
