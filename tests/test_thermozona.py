@@ -13,6 +13,11 @@ from homeassistant.const import ATTR_TEMPERATURE
 
 from custom_components import thermozona
 from custom_components.thermozona import heat_pump as heat_pump_module
+from custom_components.thermozona import price_charging as price_module
+from custom_components.thermozona.price_charging import (
+    ChargeWindow, PriceChargingManager, PriceSlot, average_price,
+    choose_charge_window, parse_prices,
+)
 from custom_components.thermozona.helpers import (
     air_coil_heating_suppressed,
     resolve_circuits,
@@ -92,7 +97,7 @@ def _config(**overrides):
     return base
 
 
-def _create_thermostat(fake_hass, controller, **zone_options):
+def _create_thermostat(fake_hass, controller, control_mode=None, **zone_options):
     return ThermozonaThermostat(
         fake_hass,
         "entry-1",
@@ -101,7 +106,7 @@ def _create_thermostat(fake_hass, controller, **zone_options):
         "sensor.living",
         controller,
         hysteresis=0.2,
-        control_mode=None,
+        control_mode=control_mode,
         pwm_cycle_time=None,
         pwm_min_on_time=None,
         pwm_min_off_time=None,
@@ -116,6 +121,25 @@ def test_resolve_circuits_supports_new_and_legacy_keys():
     assert resolve_circuits({"circuits": ["switch.a"]}) == ["switch.a"]
     assert resolve_circuits({"groups": ["switch.b"]}) == ["switch.b"]
     assert resolve_circuits({}) == []
+
+
+def test_schema_accepts_shared_pwm_and_configurable_demand_hold():
+    defaults = thermozona.CONFIG_SCHEMA({"thermozona": _config()})["thermozona"]
+    assert defaults["pwm_staggering"] is True
+    assert defaults["demand_off_delay_minutes"] == 5
+    configured = thermozona.CONFIG_SCHEMA({
+        "thermozona": _config(pwm_staggering=False, demand_off_delay_minutes=1)
+    })["thermozona"]
+    assert configured["pwm_staggering"] is False
+    assert configured["demand_off_delay_minutes"] == 1
+
+
+@pytest.mark.parametrize("delay", [-1, 31, "nan", "inf"])
+def test_schema_rejects_invalid_demand_hold(delay):
+    with pytest.raises(vol.Invalid):
+        thermozona.CONFIG_SCHEMA({
+            "thermozona": _config(demand_off_delay_minutes=delay)
+        })
 
 
 def test_schema_accepts_zone_and_cooling_options():
@@ -672,6 +696,26 @@ def test_active_zone_heating_minimum_ramps_up_and_down(fake_hass, monkeypatch):
     assert raised == 31.5
 
 
+def test_floor_flow_minimum_releases_at_comfort_and_does_not_affect_cooling(fake_hass, monkeypatch):
+    clock = SimpleNamespace(now=datetime(2026, 11, 11, 12, tzinfo=timezone.utc))
+    monkeypatch.setattr(flow_supervisor_module, "datetime", SimpleNamespace(now=lambda _tz: clock.now))
+    controller = HeatPumpController(fake_hass, _config())
+    controller.update_zone_status("office", target=20.5, current=19.8, active=True,
+                                  zone_type="floor", heating_min_flow_c=27.5)
+    flow, factors = controller.determine_flow_temperature_with_factors(HVACMode.HEAT, 10)
+    assert flow == 27.5
+    assert factors["active_min_flow_zones"] == ["office"]
+    cooling = controller.determine_flow_temperature(HVACMode.COOL, 25)
+    controller.update_zone_status("office", target=20.5, current=19.8, active=True,
+                                  zone_type="floor", heating_min_flow_c=None)
+    assert controller.determine_flow_temperature(HVACMode.COOL, 25) == cooling
+    controller.update_zone_status("office", target=20.5, current=20.5, active=True,
+                                  zone_type="floor", heating_min_flow_c=27.5)
+    clock.now += timedelta(minutes=5)
+    _flow, factors = controller.determine_flow_temperature_with_factors(HVACMode.HEAT, 10)
+    assert factors["active_min_flow_zones"] == []
+
+
 @pytest.mark.asyncio
 async def test_entry_setup_shares_controller_across_platforms(fake_hass, monkeypatch):
     from custom_components.thermozona import climate, number, select, sensor
@@ -947,6 +991,88 @@ async def test_demand_off_delay_expires_without_another_zone_update(fake_hass, m
     assert controller._last_flow_factors["command_active"] is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["heat", "cool"])
+async def test_zero_demand_hold_stops_only_after_the_last_circuit_closes(fake_hass, mode):
+    config = _config(demand_off_delay_minutes=0, heat_pump_mode="sensor.mode")
+    config["zones"]["other"] = {"circuits": ["switch.other"]}
+    controller = HeatPumpController(fake_hass, config)
+    fake_hass.states.set("sensor.mode", mode)
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("switch.zone_1", "on")
+    fake_hass.states.set("switch.other", "on")
+    controller.update_zone_status("living", target=21, current=19, active=True)
+    await controller.async_update_heat_pump_state()
+    assert controller._pump_state == mode
+
+    fake_hass.states.set("switch.zone_1", "off")
+    await controller.async_update_heat_pump_state()
+    assert controller._pump_state == mode
+
+    fake_hass.states.set("switch.other", "off")
+    await controller.async_update_heat_pump_state()
+    assert controller._pump_state == "idle"
+    assert controller._demand_off_task is None
+    assert controller._last_flow_factors["command_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_demand_hold_starts_at_closure_and_cancels_on_new_demand(fake_hass, monkeypatch):
+    clock = SimpleNamespace(now=datetime(2026, 11, 7, 12, tzinfo=timezone.utc))
+    monkeypatch.setattr(
+        heat_pump_module, "datetime", SimpleNamespace(now=lambda _tz: clock.now)
+    )
+    controller = HeatPumpController(fake_hass, _config(demand_off_delay_minutes=1))
+    controller.set_mode_value("heat")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("switch.zone_1", "on")
+    controller.update_zone_status("living", target=21, current=19, active=True)
+    await controller.async_update_heat_pump_state()
+    clock.now += timedelta(minutes=2)
+    fake_hass.states.set("switch.zone_1", "off")
+    await controller.async_update_heat_pump_state()
+    task = controller._demand_off_task
+    assert task is not None
+    assert controller._pump_state == "heat"
+    assert controller._all_circuits_off_since == clock.now
+
+    clock.now += timedelta(seconds=30)
+    await controller.async_update_heat_pump_state()
+    assert controller._demand_off_task is task
+    assert controller._pump_state == "heat"
+    fake_hass.states.set("switch.zone_1", "on")
+    await controller.async_update_heat_pump_state()
+    await asyncio.sleep(0)
+    assert task.cancelled()
+    assert controller._demand_off_task is None
+    assert controller._all_circuits_off_since is None
+    assert controller._pump_state == "heat"
+
+    fake_hass.states.set("switch.zone_1", "off")
+    await controller.async_update_heat_pump_state()
+    task = controller._demand_off_task
+    clock.now += timedelta(minutes=1)
+    await controller.async_update_heat_pump_state()
+    await asyncio.sleep(0)
+    assert task.cancelled()
+    assert controller._pump_state == "idle"
+    assert controller._all_circuits_off_since is None
+
+
+@pytest.mark.asyncio
+async def test_demand_hold_does_not_delay_explicit_shutdown(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(demand_off_delay_minutes=1))
+    controller.set_mode_value("heat")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("switch.zone_1", "on")
+    controller.update_zone_status("living", target=21, current=19, active=True)
+    await controller.async_update_heat_pump_state()
+    fake_hass.states.set("switch.zone_1", "off")
+    await controller.async_update_heat_pump_state(force_idle=True)
+    assert controller._pump_state == "idle"
+    assert controller._demand_off_task is None
+
+
 def test_name_helpers_cover_slugify_and_prettify():
     assert ThermozonaThermostat._prettify("living_room-main") == "Living room main"
     assert ThermozonaThermostat._slugify("Living Room Main!") == "living_room_main"
@@ -981,6 +1107,308 @@ def test_pwm_pi_output_is_clamped(fake_hass):
     assert duty == 100
 
 
+@pytest.mark.parametrize("mode,warm,cold", [
+    (HVACMode.HEAT, 20.1, 19.7), (HVACMode.COOL, 19.9, 20.3),
+])
+def test_pwm_does_not_build_negative_demand_while_satisfied(fake_hass, mode, warm, cold):
+    controller = HeatPumpController(fake_hass, _config())
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    now = datetime(2026, 11, 11, 12, tzinfo=timezone.utc)
+    zone._last_control_time = now - timedelta(hours=1)
+    assert zone._calculate_pwm_duty(warm, mode, now) == 0
+    assert zone._pwm_integral == 0
+    assert zone._calculate_pwm_duty(cold, mode, now + timedelta(minutes=30)) > 0
+
+
+@pytest.mark.parametrize("mode,cold,warm", [
+    (HVACMode.HEAT, 19, 20.1), (HVACMode.COOL, 21, 19.9),
+])
+def test_pwm_freezes_saturated_integral_but_allows_unwinding(fake_hass, mode, cold, warm):
+    controller = HeatPumpController(fake_hass, _config())
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    now = datetime(2026, 11, 11, 12, tzinfo=timezone.utc)
+    zone._pwm_integral = 40
+    zone._pwm_integral_mode = mode
+    zone._last_control_time = now - timedelta(minutes=30)
+    assert zone._calculate_pwm_duty(cold, mode, now) == 100
+    assert zone._pwm_integral == 40
+    assert zone._calculate_pwm_duty(warm, mode, now + timedelta(minutes=30)) < 100
+    assert zone._pwm_integral < 40
+
+
+def _pwm_comfort_fixture(fake_hass, monkeypatch, mode):
+    """Create a live PWM pulse with saved integral for comfort protection tests."""
+    from custom_components.thermozona import thermostat as module
+
+    clock = SimpleNamespace(now=datetime(2026, 11, 11, 12, tzinfo=timezone.utc))
+    monkeypatch.setattr(module, "datetime", SimpleNamespace(now=lambda _tz: clock.now))
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", mode.value)
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("sensor.zone_pwm", "19.5" if mode == HVACMode.HEAT else "20.5")
+    fake_hass.states.set("switch.zone_pwm", "off")
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    zone._pwm_integral = 40
+    zone._pwm_integral_mode = mode
+    return controller, zone, clock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,overshoot,cold", [
+    (HVACMode.HEAT, "20.5", "19.5"), (HVACMode.COOL, "19.5", "20.5"),
+])
+async def test_pwm_comfort_limit_stops_pulse_and_waits_for_next_cycle(fake_hass, monkeypatch, mode, overshoot, cold):
+    controller, zone, clock = _pwm_comfort_fixture(fake_hass, monkeypatch, mode)
+    await zone._control_heating()
+    assert fake_hass.states.get("switch.zone_pwm").state == "on"
+    clock.now += timedelta(minutes=1)
+    fake_hass.states.set("sensor.zone_pwm", overshoot)
+    await zone._control_heating()
+    assert fake_hass.states.get("switch.zone_pwm").state == "off"
+    assert zone.extra_state_attributes["pwm_comfort_limited"]
+    assert zone._pwm_integral == 0
+    assert zone._pwm_duty_cycle == 0
+    clock.now += timedelta(minutes=1)
+    fake_hass.states.set("sensor.zone_pwm", cold)
+    await zone._control_heating()
+    assert fake_hass.states.get("switch.zone_pwm").state == "off"
+    clock.now = clock.now.replace(minute=15)
+    await zone._control_heating()
+    assert fake_hass.states.get("switch.zone_pwm").state == "on"
+    assert not zone.extra_state_attributes["pwm_comfort_limited"]
+    assert zone._pwm_integral == pytest.approx(.5)
+    await controller.async_shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,overshoot,cold", [
+    (HVACMode.HEAT, "20.5", "19"), (HVACMode.COOL, "19.5", "21"),
+])
+async def test_pwm_comfort_limit_respects_minimum_off_across_boundary(fake_hass, monkeypatch, mode, overshoot, cold):
+    controller, zone, clock = _pwm_comfort_fixture(fake_hass, monkeypatch, mode)
+    await zone._control_heating()
+    clock.now = clock.now.replace(minute=14, second=50)
+    fake_hass.states.set("sensor.zone_pwm", overshoot)
+    await zone._control_heating()
+    fake_hass.states.set("sensor.zone_pwm", cold)
+    clock.now += timedelta(seconds=10)
+    await zone._control_heating()
+    assert fake_hass.states.get("switch.zone_pwm").state == "off"
+    clock.now += timedelta(minutes=2, seconds=50)
+    await zone._control_heating()
+    assert fake_hass.states.get("switch.zone_pwm").state == "on"
+    await controller.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pwm_comfort_release_skips_pulse_shorter_than_minimum(fake_hass, monkeypatch):
+    controller, zone, clock = _pwm_comfort_fixture(fake_hass, monkeypatch, HVACMode.HEAT)
+    zone._pwm_min_off_time_minutes = 10
+    await zone._control_heating()
+    clock.now = clock.now.replace(minute=14, second=50)
+    fake_hass.states.set("sensor.zone_pwm", "20.5")
+    await zone._control_heating()
+    clock.now += timedelta(minutes=10)
+    fake_hass.states.set("sensor.zone_pwm", "18.5")
+    await zone._control_heating()
+    assert fake_hass.states.get("switch.zone_pwm").state == "off"
+    assert zone._pwm_on_time == timedelta()
+    clock.now = clock.now.replace(minute=30, second=0)
+    await zone._control_heating()
+    assert fake_hass.states.get("switch.zone_pwm").state == "on"
+    await controller.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pwm_large_target_change_releases_old_comfort_hold(fake_hass, monkeypatch):
+    controller, zone, clock = _pwm_comfort_fixture(fake_hass, monkeypatch, HVACMode.HEAT)
+    clock.now += timedelta(minutes=1)
+    fake_hass.states.set("sensor.zone_pwm", "20.5")
+    await zone._control_heating()
+    assert zone._pwm_comfort_limited
+    clock.now += timedelta(minutes=3)
+    await zone.async_set_temperature(**{ATTR_TEMPERATURE: 23})
+    assert not zone._pwm_comfort_limited
+    assert fake_hass.states.get("switch.zone_pwm").state == "on"
+    await controller.async_shutdown()
+
+
+def _thermal_test_controller(fake_hass, now):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode",
+        thermal_compensation={"enabled": True, "supply_sensor": "sensor.water"}))
+    for entity, value in [("sensor.mode", "heat"), ("sensor.outside", "10"),
+                          ("sensor.water", "26"), ("sensor.living", "19.5")]:
+        fake_hass.states.set(entity, value)
+        fake_hass.states.get(entity).last_reported = now
+    return controller
+
+
+def test_pwm_uses_measured_water_and_outside_but_retains_full_output(fake_hass):
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    warmer = zone._calculate_pwm_duty(19.5, HVACMode.HEAT, now)
+    assert zone._pwm_thermal.reason == "active"
+    assert zone.extra_state_attributes["pwm_measured_supply_c"] == 26
+    zone._reset_pwm_state(True)
+    fake_hass.states.set("sensor.outside", "0")
+    fake_hass.states.get("sensor.outside").last_reported = now
+    colder = zone._calculate_pwm_duty(19.5, HVACMode.HEAT, now)
+    assert colder > warmer
+    zone._pwm_integral = 50
+    assert zone._calculate_pwm_duty(19.5, HVACMode.HEAT, now) == 100
+
+
+def test_pwm_cooling_does_not_use_heating_compensation(fake_hass):
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    duty = zone._calculate_pwm_duty(20.5, HVACMode.COOL, now)
+    assert duty == 16
+    assert zone._pwm_thermal.factor == 1
+    assert zone._pwm_thermal.reason == "not_space_heating"
+
+
+@pytest.mark.asyncio
+async def test_pwm_water_changes_do_not_restart_the_aligned_cycle(fake_hass, monkeypatch):
+    from custom_components.thermozona import thermostat as module
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(module, "datetime", SimpleNamespace(now=lambda _tz: now))
+    controller = _thermal_test_controller(fake_hass, now)
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    fake_hass.states.set("sensor.zone_pwm", "19.5")
+    fake_hass.states.set("switch.zone_pwm", "off")
+    await zone._control_heating()
+    before = (zone._pwm_cycle_start, zone._pwm_on_time, zone._pwm_integral)
+    fake_hass.states.set("sensor.water", "30")
+    fake_hass.states.get("sensor.water").last_reported = now
+    await zone._control_heating()
+    assert (zone._pwm_cycle_start, zone._pwm_on_time, zone._pwm_integral) == before
+    await controller.async_shutdown()
+
+
+def test_solar_forecast_trims_only_near_comfort_and_respects_zone_exposure(fake_hass):
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    controller._entry_config["thermal_compensation"]["solar_forecast_sensor"] = "sensor.solar"
+    fake_hass.states.set("sensor.solar", "500")
+    fake_hass.states.get("sensor.solar").last_reported = now
+    fake_hass.states.get("sensor.solar").attributes = {"unit_of_measurement": "W/m2"}
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    shaded = _create_pwm_thermostat(fake_hass, controller)
+    shaded._zone_solar_weight = 0
+    assert zone._calculate_pwm_duty(19.8, HVACMode.HEAT, now) < shaded._calculate_pwm_duty(19.8, HVACMode.HEAT, now)
+    assert zone._pwm_thermal.solar_w_m2 == 500
+    zone._reset_pwm_state(True)
+    shaded._reset_pwm_state(True)
+    assert zone._calculate_pwm_duty(19, HVACMode.HEAT, now) == shaded._calculate_pwm_duty(19, HVACMode.HEAT, now)
+    assert zone._pwm_thermal.solar_w_m2 is None
+
+
+def test_recovery_compares_current_conditions_with_observed_reference(fake_hass):
+    from custom_components.thermozona.room_recovery import HeatingRate
+    from custom_components.thermozona.thermal_conditions import ThermalReference
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    zone = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work",
+        schedule_recovery={"enabled": True})
+    zone._recovery.profile = HeatingRate(.4, 4, 2, ThermalReference(25, 10, 20))
+    assert zone._recovery_compensation().factor < 1
+    zone._recovery.profile = HeatingRate(.4, 4, 2)
+    assert zone._recovery_compensation().reason == "unreferenced_history"
+    zone._manual_mode = HVACMode.OFF
+    assert zone._recovery_compensation().factor == 1
+
+
+@pytest.mark.asyncio
+async def test_thermal_compensation_does_not_override_boiler_priority(fake_hass):
+    from custom_components.thermozona.hot_water import HotWaterManager
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    controller.hot_water = HotWaterManager(fake_hass, {"demand_entity": "input_boolean.dhw"})
+    fake_hass.states.set("input_boolean.dhw", "on")
+    fake_hass.states.set("switch.zone_1", "on")
+    zone = _create_thermostat(fake_hass, controller, control_mode="pwm")
+    assert controller.thermal_compensation(room_c=19, target_c=20, now=now).reason == "boiler_priority"
+    await zone._control_heating()
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    assert zone._pwm_thermal.factor == 1
+    await controller.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_startup_hold_preserves_restored_integral_until_platforms_are_ready(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("sensor.living", "19.5")
+    fake_hass.states.set("switch.zone_1", "off")
+    controller.begin_platform_setup()
+    zone = _create_thermostat(fake_hass, controller, control_mode="pwm")
+    zone.async_get_last_state = AsyncMock(return_value=SimpleNamespace(state="auto",
+        attributes={"temperature": 20, "pwm_integral": 40, "pwm_integral_mode": "heat"}))
+    await zone.async_added_to_hass()
+    await zone._control_heating()
+    assert zone._pwm_integral == 40
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    controller._flow_output_ready = True
+    await zone._control_heating()
+    assert zone._pwm_duty_cycle > 80
+    assert zone._pwm_integral >= 40
+    await controller.async_shutdown()
+    await zone.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_startup_waits_for_first_room_reading_without_losing_integral(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("switch.zone_1", "off")
+    zone = _create_thermostat(fake_hass, controller, control_mode="pwm")
+    zone._pwm_integral = 40
+    zone._pwm_integral_mode = HVACMode.HEAT
+    await zone._control_heating()
+    assert zone._pwm_integral == 40
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    fake_hass.states.set("sensor.living", "19.5")
+    await zone._control_heating()
+    assert zone._pwm_integral >= 40
+    fake_hass.states.set("sensor.living", "unavailable")
+    await zone._control_heating()
+    assert zone._pwm_integral == 0
+    await controller.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_boiler_pause_freezes_integral_and_excludes_pause_time(fake_hass):
+    from custom_components.thermozona.hot_water import HotWaterManager
+    now = datetime.now(timezone.utc)
+    controller = _thermal_test_controller(fake_hass, now)
+    controller.hot_water = HotWaterManager(fake_hass, {"demand_entity": "input_boolean.dhw"})
+    fake_hass.states.set("input_boolean.dhw", "on")
+    fake_hass.states.set("switch.zone_1", "on")
+    zone = _create_thermostat(fake_hass, controller, control_mode="pwm")
+    zone._pwm_integral = 20
+    zone._pwm_integral_mode = HVACMode.HEAT
+    zone._last_control_time = now-timedelta(hours=2)
+    await zone._control_heating()
+    assert zone._pwm_integral == 20
+    assert zone._last_control_time is None
+    fake_hass.states.set("input_boolean.dhw", "off")
+    await zone._control_heating()
+    assert zone._pwm_integral == pytest.approx(20.5)
+    await controller.async_shutdown()
+
+
+def test_integral_is_reset_on_real_heating_cooling_direction_change(fake_hass):
+    controller = HeatPumpController(fake_hass, _config())
+    zone = _create_pwm_thermostat(fake_hass, controller)
+    zone._pwm_integral = 50
+    zone._pwm_integral_mode = HVACMode.HEAT
+    duty = zone._calculate_pwm_duty(20.5, HVACMode.COOL, datetime.now(timezone.utc))
+    assert duty == 16
+    assert zone._pwm_integral_mode == HVACMode.COOL
+
+
 def test_pwm_cycle_applies_minimum_times(fake_hass):
     controller = HeatPumpController(fake_hass, _config())
     thermostat = _create_pwm_thermostat(fake_hass, controller)
@@ -1000,6 +1428,28 @@ def test_pwm_cycle_applies_minimum_times(fake_hass):
 
     assert thermostat._pwm_on_time.total_seconds() / 60 >= 3
     assert thermostat._pwm_cycle_start == cycle_start
+
+
+@pytest.mark.parametrize("cycle,duty", [(15, 70), (15, 80), (15, 90), (30, 85), (30, 90), (30, 95)])
+@pytest.mark.parametrize("was_active", [False, True])
+def test_pwm_actuator_delay_preserves_partial_cycle_minimum_off(cycle, duty, was_active):
+    from custom_components.thermozona.pro.pwm import calculate_on_time_minutes
+
+    on_time = calculate_on_time_minutes(duty_cycle=duty, cycle_time_minutes=cycle,
+        min_on_time_minutes=3, min_off_time_minutes=3,
+        actuator_delay_minutes=3, was_active=was_active)
+    assert on_time >= 3
+    assert cycle - on_time >= 3
+
+
+@pytest.mark.parametrize("cycle", [15, 30])
+@pytest.mark.parametrize("duty", [96, 100])
+def test_pwm_near_full_demand_can_keep_circuit_open(cycle, duty):
+    from custom_components.thermozona.pro.pwm import calculate_on_time_minutes
+
+    assert calculate_on_time_minutes(duty_cycle=duty, cycle_time_minutes=cycle,
+        min_on_time_minutes=3, min_off_time_minutes=3,
+        actuator_delay_minutes=3, was_active=False) == cycle
 
 
 def test_pwm_cycle_is_aligned_to_schedule(fake_hass):
@@ -1520,6 +1970,31 @@ async def test_pwm_stagger_offset_produces_different_cycle_starts(fake_hass):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [HVACMode.HEAT, HVACMode.COOL])
+async def test_shared_pwm_aligns_zones_without_changing_duty(fake_hass, mode):
+    controller = HeatPumpController(fake_hass, _config(pwm_staggering=False))
+    zone_a = _create_pwm_thermostat(fake_hass, controller)
+    zone_b = _create_pwm_thermostat(fake_hass, controller)
+    controller.register_thermostat(zone_a)
+    controller.register_thermostat(zone_b)
+    now = datetime(2026, 11, 7, 12, tzinfo=timezone.utc)
+    start_a = zone_a._get_aligned_pwm_cycle_start(now)
+    start_b = zone_b._get_aligned_pwm_cycle_start(now)
+    assert start_a == start_b == now
+    zone_a._calculate_pwm_duty = Mock(return_value=20)
+    zone_b._calculate_pwm_duty = Mock(return_value=60)
+    for zone in [zone_a, zone_b]:
+        zone._start_new_pwm_cycle(20, mode, now, now, False)
+    assert zone_a._pwm_on_time == timedelta(minutes=6)
+    assert zone_b._pwm_on_time == timedelta(minutes=12)
+    assert zone_a._attr_target_temperature == 20
+    assert zone_b._attr_target_temperature == 20
+
+    controller.refresh_entry_config(_config(pwm_staggering=True))
+    assert zone_a._get_aligned_pwm_cycle_start(now) != zone_b._get_aligned_pwm_cycle_start(now)
+
+
+@pytest.mark.asyncio
 async def test_pwm_stagger_covers_full_cycle(fake_hass):
     controller = HeatPumpController(fake_hass, _config())
     zones = []
@@ -1610,7 +2085,7 @@ def test_pwm_actuator_delay_zero_duty_stays_zero(fake_hass):
     assert thermostat._pwm_on_time == timedelta()
 
 
-def test_pwm_actuator_delay_clamped_to_cycle_time(fake_hass):
+def test_pwm_actuator_delay_clamped_to_preserve_minimum_off(fake_hass):
     controller = HeatPumpController(fake_hass, _config())
     thermostat = _create_pwm_thermostat(fake_hass, controller)
     thermostat._pwm_actuator_delay_minutes = 3
@@ -1620,7 +2095,9 @@ def test_pwm_actuator_delay_clamped_to_cycle_time(fake_hass):
     cycle_start = thermostat._get_aligned_pwm_cycle_start(now)
     thermostat._start_new_pwm_cycle(19.0, HVACMode.HEAT, now, cycle_start, False)
 
-    assert thermostat._pwm_on_time == timedelta(minutes=thermostat._pwm_cycle_time_minutes)
+    assert thermostat._pwm_on_time == timedelta(
+        minutes=thermostat._pwm_cycle_time_minutes - thermostat._pwm_min_off_time_minutes
+    )
 
 
 def test_pwm_actuator_delay_default_value(fake_hass):
@@ -1628,3 +2105,751 @@ def test_pwm_actuator_delay_default_value(fake_hass):
     thermostat = _create_pwm_thermostat(fake_hass, controller)
 
     assert thermostat._pwm_actuator_delay_minutes == 3
+
+
+# Price-aware house charging.
+
+def _price_response(start, hourly_prices, quarters=False):
+    rows = []
+    for index, price in enumerate(hourly_prices):
+        for quarter in range(4 if quarters else 1):
+            rows.append({
+                "start_time": (start + timedelta(hours=index, minutes=quarter * 15)).isoformat(),
+                "price": price,
+            })
+    return {"prices": {"home": rows}}
+
+
+@pytest.mark.parametrize("quarters", [False, True])
+def test_price_plan_selects_contiguous_cheap_block_before_peak(quarters):
+    now = datetime(2026, 11, 7, tzinfo=timezone.utc)
+    slots = parse_prices(_price_response(now, [0.4, 0.4, 0.1, 0.1, 0.1] + [0.4] * 30, quarters))
+    window = choose_charge_window(slots, now)
+    assert window.start == now + timedelta(hours=2)
+    assert window.end == now + timedelta(hours=5)
+    assert window.price == pytest.approx(0.1)
+    assert window.following_price == pytest.approx(0.4)
+
+
+def test_price_plan_requires_spread_and_complete_future_prices():
+    now = datetime(2026, 11, 7, tzinfo=timezone.utc)
+    flat = parse_prices(_price_response(now, [0.3] * 24))
+    assert choose_charge_window(flat, now) is None
+    incomplete = parse_prices(_price_response(now, [0.1, 0.1, 0.1, 0.4]))
+    assert choose_charge_window(incomplete, now) is None
+
+
+def test_price_plan_accepts_negative_prices_and_duration_weights():
+    now = datetime(2026, 11, 7, tzinfo=timezone.utc)
+    slots = parse_prices(_price_response(now, [-0.1] * 3 + [0.3] * 12))
+    assert choose_charge_window(slots, now).price == pytest.approx(-0.1)
+    weighted = [PriceSlot(now, now + timedelta(minutes=15), 0.1),
+                PriceSlot(now + timedelta(minutes=15), now + timedelta(hours=1), 0.3)]
+    assert average_price(weighted, now, now + timedelta(hours=1)) == pytest.approx(0.25)
+    assert average_price(weighted, now, now + timedelta(hours=2)) is None
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "missing", "duplicate", "naive", "multiple_homes"])
+def test_price_parser_rejects_unsafe_or_ambiguous_data(bad):
+    now = datetime(2026, 11, 7, tzinfo=timezone.utc)
+    data = _price_response(now, [0.1] * 12, quarters=True)
+    rows = data["prices"]["home"]
+    if bad in {"nan", "inf"}:
+        rows[0]["price"] = bad
+    elif bad == "missing":
+        rows.pop(3)
+    elif bad == "duplicate":
+        rows.append(rows[0])
+    elif bad == "naive":
+        rows[0]["start_time"] = "2026-11-07T00:00:00"
+    else:
+        data["prices"]["other"] = rows
+    with pytest.raises(ValueError):
+        parse_prices(data)
+
+
+def test_price_parser_handles_clock_change_using_utc_intervals():
+    data = {"prices": {"home": [
+        {"start_time": "2026-10-25T02:00:00+02:00", "price": 0.1},
+        {"start_time": "2026-10-25T02:00:00+01:00", "price": 0.2},
+        {"start_time": "2026-10-25T03:00:00+01:00", "price": 0.3},
+    ]}}
+    slots = parse_prices(data)
+    assert all(slot.end - slot.start == timedelta(hours=1) for slot in slots)
+    assert slots[0].end == slots[1].start
+
+
+@pytest.mark.asyncio
+async def test_price_manager_preview_auto_expiry_and_failed_fetch(fake_hass, monkeypatch):
+    clock = SimpleNamespace(now=datetime(2026, 11, 7, tzinfo=timezone.utc))
+    monkeypatch.setattr(price_module, "datetime", SimpleNamespace(
+        now=lambda _tz: clock.now, fromisoformat=datetime.fromisoformat
+    ))
+    response = _price_response(clock.now, [0.1] * 3 + [0.4] * 30, quarters=True)
+    fake_hass.services.async_call = AsyncMock(return_value=response)
+    manager = PriceChargingManager(fake_hass, {"mode": "preview"}, Mock())
+    await manager.async_start()
+    assert manager.state == "preview"
+    assert manager.attributes["planned_state"] == "charging"
+    assert manager.boost == 0
+    await manager.async_set_mode("auto")
+    assert manager.boost == 0.5
+    original = manager.window
+    clock.now += timedelta(minutes=30)
+    await manager.async_refresh()
+    assert manager.window == original
+    clock.now += timedelta(hours=3)
+    assert manager.boost == 0
+    assert manager.state == "coasting"
+    fake_hass.services.async_call.side_effect = RuntimeError("provider offline")
+    await manager.async_refresh()
+    assert manager.state == "unavailable"
+    assert manager.boost == 0
+    await manager.async_stop()
+    assert manager.state == "off"
+
+
+@pytest.mark.asyncio
+async def test_price_manager_does_not_apply_response_after_disabled(fake_hass):
+    now = datetime.now(timezone.utc)
+    started, resume = asyncio.Event(), asyncio.Event()
+    async def fetch(*args, **kwargs):
+        started.set()
+        await resume.wait()
+        return _price_response(now, [0.1] * 3 + [0.4] * 12)
+    fake_hass.services.async_call = fetch
+    manager = PriceChargingManager(fake_hass, {"mode": "auto"}, Mock())
+    task = asyncio.create_task(manager.async_refresh())
+    await started.wait()
+    stop = asyncio.create_task(manager.async_set_mode("off"))
+    await asyncio.sleep(0)
+    resume.set()
+    await asyncio.gather(task, stop)
+    assert manager.boost == 0
+    assert manager.window is None
+
+
+@pytest.mark.parametrize("mode,zone_type,opt_in,expected", [
+    ("heat", "floor", True, 0.5),
+    ("heat", "floor", False, 0),
+    ("heat", "air_coil", True, 0),
+    ("cool", "floor", True, 0),
+    ("off", "floor", True, 0),
+])
+def test_price_headroom_only_applies_to_opted_in_heating_floors(fake_hass, mode, zone_type, opt_in, expected):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", mode)
+    now = datetime.now(timezone.utc)
+    manager = controller.price_charging
+    manager.mode = "auto"
+    manager._slots = [PriceSlot(now - timedelta(hours=1), now + timedelta(hours=4), 0.1)]
+    manager.window = ChargeWindow(now - timedelta(minutes=1), now + timedelta(hours=3), 0.1, 0.4)
+    thermostat = _create_thermostat(fake_hass, controller, price_charging=opt_in, zone_type=zone_type)
+    assert thermostat.price_charging_boost == expected
+    assert thermostat._attr_target_temperature == 20
+    assert thermostat.effective_target_temperature == 20 + expected
+
+
+@pytest.mark.asyncio
+async def test_price_charging_opens_floor_then_coasts_without_changing_comfort(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("sensor.living", "20.1")
+    fake_hass.states.set("switch.zone_1", "off")
+    thermostat = _create_thermostat(fake_hass, controller, price_charging=True)
+    now = datetime.now(timezone.utc)
+    manager = controller.price_charging
+    manager.mode = "auto"
+    manager._slots = [PriceSlot(now - timedelta(hours=1), now + timedelta(hours=4), 0.1)]
+    manager.window = ChargeWindow(now - timedelta(minutes=1), now + timedelta(hours=3), 0.1, 0.4)
+    await thermostat._control_heating()
+    assert fake_hass.states.get("switch.zone_1").state == "on"
+    assert thermostat._attr_target_temperature == 20
+    assert controller._zone_status["living_room"]["target"] == 20.5
+    fake_hass.states.set("sensor.living", "20.5")
+    await thermostat._control_heating()
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    manager.mode = "off"
+    await thermostat._control_heating()
+    assert thermostat.effective_target_temperature == 20
+    assert thermostat._attr_target_temperature == 20
+    await thermostat.async_turn_off()
+    manager.mode = "auto"
+    assert thermostat.price_charging_boost == 0
+    await controller.async_shutdown()
+
+
+@pytest.mark.parametrize("field,value", [("boost_c", "nan"), ("charge_hours", 0), ("mode", "force")])
+def test_price_schema_rejects_invalid_configuration(field, value):
+    with pytest.raises(vol.Invalid):
+        thermozona.CONFIG_SCHEMA({"thermozona": _config(price_charging={field: value})})
+
+
+@pytest.mark.asyncio
+async def test_price_pwm_recalculates_demand_when_charge_ends(fake_hass, monkeypatch):
+    from custom_components.thermozona import thermostat as thermostat_module
+    now = datetime(2026, 11, 7, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(thermostat_module, "datetime", SimpleNamespace(now=lambda _tz: now))
+    monkeypatch.setattr(price_module, "datetime", SimpleNamespace(now=lambda _tz: now))
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("sensor.living", "20.1")
+    fake_hass.states.set("switch.zone_1", "off")
+    thermostat = _create_thermostat(fake_hass, controller, control_mode="pwm", price_charging=True)
+    manager = controller.price_charging
+    manager.mode = "auto"
+    manager._slots = [PriceSlot(now - timedelta(hours=1), now + timedelta(hours=4), 0.1)]
+    manager.window = ChargeWindow(now - timedelta(minutes=1), now + timedelta(hours=3), 0.1, 0.4)
+    await thermostat._control_heating()
+    assert thermostat._pwm_duty_cycle > 0
+    assert controller._zone_status["living_room"]["target"] == 20.5
+    manager.mode = "off"
+    await thermostat._control_heating()
+    assert thermostat._pwm_duty_cycle == 0
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    assert thermostat._attr_target_temperature == 20
+    await controller.async_shutdown()
+
+
+@pytest.mark.parametrize("outside", ["19", "unavailable"])
+def test_price_charging_respects_automatic_heating_lockout(fake_hass, outside):
+    controller = HeatPumpController(fake_hass, _config())
+    now = datetime.now(timezone.utc)
+    manager = controller.price_charging
+    manager.mode = "auto"
+    manager._slots = [PriceSlot(now - timedelta(hours=1), now + timedelta(hours=4), 0.1)]
+    manager.window = ChargeWindow(now - timedelta(minutes=1), now + timedelta(hours=3), 0.1, 0.4)
+    fake_hass.states.set("sensor.outside", outside)
+    thermostat = _create_thermostat(fake_hass, controller, price_charging=True)
+    assert thermostat.price_charging_boost == 0
+
+
+@pytest.mark.asyncio
+async def test_default_price_charging_does_not_fetch_and_removes_timer(fake_hass, monkeypatch):
+    remove = Mock()
+    monkeypatch.setattr(price_module, "async_track_time_interval", Mock(return_value=remove))
+    fake_hass.services.async_call = AsyncMock()
+    manager = PriceChargingManager(fake_hass, {}, Mock())
+    await manager.async_start()
+    fake_hass.services.async_call.assert_not_called()
+    await manager.async_stop()
+    remove.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode,temperature,expected', [('monitor','49.9',False),('auto','unavailable',False),('auto','49.9',True)])
+async def test_hot_water_respects_monitor_and_sensor_validity(fake_hass,mode,temperature,expected):
+    from custom_components.thermozona.hot_water import HotWaterManager
+    now=datetime.now(timezone.utc)
+    config={'mode':mode,'temperature_sensor':'sensor.tank','soc_sensor':'sensor.soc',
+            'demand_entity':'input_boolean.dhw','source_entity':'input_select.source',
+            'last_off_entity':'input_datetime.off','started_at_entity':'input_datetime.start',
+            'start_service':'input_boolean.turn_on','stop_service':'input_boolean.turn_off',
+            'start_data':{'entity_id':'input_boolean.dhw'},'stop_data':{'entity_id':'input_boolean.dhw'}}
+    manager=HotWaterManager(fake_hass,config)
+    manager._prices.async_refresh=AsyncMock()
+    manager._prices._slots=[PriceSlot(now-timedelta(hours=1),now+timedelta(hours=3),.1)]
+    manager.window=ChargeWindow(now-timedelta(minutes=1),now+timedelta(hours=1),.1,.1)
+    for entity,value in [('sensor.tank',temperature),('sensor.soc','24'),('input_boolean.dhw','off'),('input_select.source','none'),('input_datetime.off',''),('input_datetime.start','')]:
+        fake_hass.states.set(entity,value)
+    fake_hass.states.get('input_datetime.off').attributes={'timestamp':now.timestamp()-18000}
+    fake_hass.states.get('input_datetime.start').attributes={'timestamp':now.timestamp()-86400}
+    fake_hass.services.async_call=AsyncMock()
+    await manager.async_refresh()
+    assert manager._owned is expected
+    if expected:
+        assert manager.state=='requested'
+        fake_hass.states.set('input_boolean.dhw','on')
+        fake_hass.states.set('input_select.source','price')
+        await manager.async_refresh()
+        assert manager._owned
+        manager.window=ChargeWindow(now-timedelta(hours=2),now-timedelta(minutes=1),.1,.1)
+        await manager.async_refresh()
+        assert not manager._owned
+        assert any(c.args[1]=='turn_off' for c in fake_hass.services.async_call.call_args_list)
+    else:
+        fake_hass.services.async_call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_price_and_hot_water_select_listener_lifecycle(fake_hass):
+    from custom_components.thermozona.select import ThermozonaPriceChargingSelect,ThermozonaHotWaterSelect
+    from custom_components.thermozona.hot_water import HotWaterManager
+    controller=HeatPumpController(fake_hass,_config())
+    controller.hot_water=HotWaterManager(fake_hass,{"mode":"monitor"})
+    for cls,manager in [(ThermozonaPriceChargingSelect,controller.price_charging),(ThermozonaHotWaterSelect,controller.hot_water)]:
+        entity=cls("entry-1",controller)
+        await entity.async_added_to_hass()
+        manager._notify()
+        assert entity._attr_current_option==manager.mode
+        await entity.async_will_remove_from_hass()
+        assert not manager._listeners
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('demand,active,blocked',[('on','off',True),('off','on',True),('off','unknown',True),('off','off',False)])
+async def test_boiler_priority_blocks_cv_until_actual_boiler_is_idle(fake_hass,demand,active,blocked):
+    from custom_components.thermozona.hot_water import HotWaterManager
+    controller=HeatPumpController(fake_hass,_config(heat_pump_mode='sensor.mode'))
+    controller.hot_water=HotWaterManager(fake_hass,{'demand_entity':'input_boolean.dhw','active_sensors':['binary_sensor.dhw']})
+    fake_hass.states.set('input_boolean.dhw',demand)
+    fake_hass.states.set('binary_sensor.dhw',active)
+    fake_hass.states.set('sensor.mode','heat')
+    thermostat=_create_thermostat(fake_hass,controller)
+    assert controller.space_heating_suspended is blocked
+    assert thermostat._resolve_effective_mode('heat')==(HVACMode.OFF if blocked else HVACMode.HEAT)
+    assert thermostat._resolve_effective_mode('cool')==(HVACMode.OFF if blocked else HVACMode.COOL)
+    if blocked:
+        fake_hass.states.set('switch.zone_1','on')
+        await controller.async_update_heat_pump_state()
+        assert controller._pump_state=='idle'
+        assert controller._last_flow_factors['command_active'] is False
+    assert thermostat._attr_target_temperature==20
+
+
+def test_house_charge_window_excludes_reserved_boiler_time():
+    now=datetime(2026,11,7,tzinfo=timezone.utc)
+    slots=parse_prices(_price_response(now,[.4,.4,.1,.1,.1,.2,.2,.2]+[.5]*20))
+    blocked=(now+timedelta(hours=3),now+timedelta(hours=4))
+    window=choose_charge_window(slots,now,excluded_windows=[blocked])
+    assert window is not None
+    assert window.end<=blocked[0] or window.start>=blocked[1]
+
+
+@pytest.mark.asyncio
+async def test_absence_schedule_lowers_office_target_and_prevents_price_charging(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("sensor.living", "19.5")
+    fake_hass.states.set("switch.zone_1", "on")
+    fake_hass.states.set("schedule.work", "on")
+    now = datetime.now(timezone.utc)
+    manager = controller.price_charging
+    manager.mode = "auto"
+    manager._slots = [PriceSlot(now-timedelta(hours=1), now+timedelta(hours=4), .1)]
+    manager.window = ChargeWindow(now-timedelta(minutes=1), now+timedelta(hours=3), .1, .4)
+    thermostat = _create_thermostat(fake_hass, controller, control_mode="pwm",
+        price_charging=True, setback_schedule="schedule.work", setback_c=1)
+    thermostat._pwm_integral = 100
+    await thermostat._control_heating()
+    assert thermostat._attr_target_temperature == 20
+    assert thermostat.target_temperature == 19
+    assert thermostat.effective_target_temperature == 19
+    assert thermostat.price_charging_boost == 0
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    fake_hass.states.set("schedule.work", "off")
+    await thermostat._control_heating()
+    assert thermostat.target_temperature == 20
+    assert thermostat.effective_target_temperature == 20.5
+    assert thermostat.extra_state_attributes["comfort_temperature"] == 20
+    await controller.async_shutdown()
+
+
+def test_schedule_does_not_lower_cooling_target_or_enable_an_off_zone(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("schedule.work", "on")
+    fake_hass.states.set("sensor.mode", "cool")
+    thermostat = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work")
+    assert thermostat.target_temperature == 20
+    fake_hass.states.set("sensor.mode", "heat")
+    thermostat._manual_mode = HVACMode.OFF
+    assert thermostat.target_temperature == 20
+    assert thermostat.price_charging_boost == 0
+
+
+@pytest.mark.asyncio
+async def test_heating_setback_does_not_create_automatic_cooling_demand(fake_hass):
+    controller = HeatPumpController(fake_hass, _config())
+    fake_hass.states.set("schedule.work", "on")
+    fake_hass.states.set("sensor.outside", "25")
+    fake_hass.states.set("sensor.living", "19.5")
+    fake_hass.states.set("switch.zone_1", "off")
+    thermostat = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work")
+    await thermostat._control_heating()
+    assert controller.determine_auto_mode() == HVACMode.OFF
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    fake_hass.states.set("sensor.living", "21")
+    await thermostat._control_heating()
+    assert controller.determine_auto_mode() == HVACMode.COOL
+    assert thermostat.target_temperature == 20
+    await controller.async_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_adjusting_a_scheduled_target_preserves_one_degree_offset(fake_hass):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("schedule.work", "on")
+    fake_hass.states.set("sensor.living", "20")
+    thermostat = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work")
+    await thermostat.async_set_temperature(temperature=19.5)
+    assert thermostat.target_temperature == 19.5
+    fake_hass.states.set("schedule.work", "off")
+    assert thermostat.target_temperature == 20.5
+    await controller.async_shutdown()
+
+
+def _smart_hot_water_config():
+    return {"mode": "auto", "temperature_sensor": "sensor.tank", "soc_sensor": "sensor.soc",
+            "demand_entity": "input_boolean.dhw", "source_entity": "input_select.source",
+            "last_off_entity": "input_datetime.off", "started_at_entity": "input_datetime.start",
+            "start_service": "input_boolean.turn_on", "stop_service": "input_boolean.turn_off",
+            "start_data": {"entity_id": "input_boolean.dhw"}, "stop_data": {"entity_id": "input_boolean.dhw"},
+            "smart_charging": {"target_entity": "input_number.target", "normal_temperature": 50,
+                "max_temperature": 55, "thermal_model": {"charge_cop": 2.5, "normal_cop": 3,
+                    "loss_percent_per_hour": 1, "min_saving_percent": 5}}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("soc", ["24", "unavailable"])
+async def test_smart_hot_water_charges_before_learned_use_and_stops_at_bounded_target(fake_hass, monkeypatch, soc):
+    from custom_components.thermozona import hot_water as module
+    from custom_components.thermozona.thermal_planning import UsagePeriod, UsageProfile
+    clock = SimpleNamespace(now=datetime(2026, 11, 7, 4, tzinfo=timezone.utc))
+    monkeypatch.setattr(module, "datetime", SimpleNamespace(now=lambda _tz: clock.now))
+    manager = module.HotWaterManager(fake_hass, _smart_hot_water_config())
+    manager._prices.async_refresh = AsyncMock()
+    manager._prices._slots = [PriceSlot(clock.now+timedelta(hours=i),clock.now+timedelta(hours=i+1),
+        .1 if i < 1 else .4) for i in range(12)]
+    manager._usage = UsageProfile((UsagePeriod(7*60, 8, 5),), 7, 5)
+    manager._usage_updated = clock.now
+    for entity, value in [("sensor.tank", "49.8"), ("sensor.soc", soc),
+                          ("input_boolean.dhw", "off"), ("input_select.source", "none"),
+                          ("input_number.target", "50"), ("input_datetime.off", ""), ("input_datetime.start", "")]:
+        fake_hass.states.set(entity, value)
+    fake_hass.states.get("input_datetime.off").attributes = {"timestamp": clock.now.timestamp()-18000}
+    fake_hass.states.get("input_datetime.start").attributes = {"timestamp": clock.now.timestamp()-86400}
+    await manager.async_refresh()
+    assert manager._owned
+    assert 50 < manager._active_target <= 55
+    assert manager.window.end <= manager.window.use_time - timedelta(minutes=15)
+    assert fake_hass.services.calls[0][:2] == ("input_number", "set_value")
+    fake_hass.states.set("sensor.tank", str(manager._active_target))
+    fake_hass.states.set("input_select.source", "price")
+    await manager.async_refresh()
+    assert not manager._owned
+    assert any(service == "turn_off" for _, service, _, _ in fake_hass.services.calls)
+
+
+def _hot_water_start_fixture(fake_hass, monkeypatch, temperature="49.4"):
+    """Reproduce a boost with Ecoforest's five-degree startup hysteresis."""
+    from custom_components.thermozona import hot_water as module
+
+    clock = SimpleNamespace(now=datetime(2026, 11, 9, 3, 45, tzinfo=timezone.utc))
+    monkeypatch.setattr(module, "datetime", SimpleNamespace(now=lambda _tz: clock.now))
+    config = _smart_hot_water_config()
+    config["smart_charging"]["start_differential_sensor"] = "sensor.start_delta"
+    config["heating_active_sensor"] = "binary_sensor.actual_dhw"
+    config["active_sensors"] = ["binary_sensor.actual_dhw", "sensor.bus_dhw"]
+    manager = module.HotWaterManager(fake_hass, config)
+    manager._prices.async_refresh = AsyncMock()
+    manager._prices._slots = [PriceSlot(clock.now, clock.now + timedelta(hours=2), .1)]
+    manager._refresh_usage = AsyncMock()
+    window = ChargeWindow(clock.now, clock.now + timedelta(hours=1), .1, .4,
+                          target_temperature=53.5)
+    manager._smart_window = Mock(return_value=window)
+    for entity, value in [
+        ("sensor.tank", temperature), ("sensor.soc", "24"),
+        ("input_boolean.dhw", "off"), ("input_select.source", "none"),
+        ("input_number.target", "50"), ("input_datetime.off", ""),
+        ("input_datetime.start", ""), ("sensor.start_delta", "5"),
+        ("binary_sensor.actual_dhw", "off"), ("sensor.bus_dhw", "0"),
+    ]:
+        fake_hass.states.set(entity, value)
+    fake_hass.states.get("input_datetime.off").attributes = {"timestamp": clock.now.timestamp()-18000}
+    fake_hass.states.get("input_datetime.start").attributes = {"timestamp": clock.now.timestamp()-86400}
+    return manager, clock
+
+
+@pytest.mark.asyncio
+async def test_hot_water_boost_crosses_native_start_threshold_within_limit(fake_hass, monkeypatch):
+    manager, _clock = _hot_water_start_fixture(fake_hass, monkeypatch)
+    await manager.async_refresh()
+
+    assert manager._active_target == 55
+    assert float(fake_hass.states.get("input_number.target").state) == 55
+    assert manager._active_target - 5 > 49.4
+    assert manager.blocks_space_heating
+    assert manager.attributes["heating_confirmed"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("temperature", ["50", "50.2"])
+async def test_hot_water_skips_unreachable_start_without_blocking_rooms(fake_hass, monkeypatch, temperature):
+    manager, _clock = _hot_water_start_fixture(fake_hass, monkeypatch, temperature)
+    await manager.async_refresh()
+
+    assert manager.state == "waiting_for_start_threshold"
+    assert not manager._owned
+    assert not manager.blocks_space_heating
+    assert fake_hass.services.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("differential,unit", [
+    ("unavailable", "°C"), ("nan", "°C"), ("inf", "°C"),
+    ("-1", "°C"), ("21", "°C"), ("5", "°F"),
+])
+async def test_hot_water_skips_invalid_start_differential(fake_hass, monkeypatch, differential, unit):
+    manager, _clock = _hot_water_start_fixture(fake_hass, monkeypatch)
+    fake_hass.states.set("sensor.start_delta", differential)
+    fake_hass.states.get("sensor.start_delta").attributes = {"unit_of_measurement": unit}
+    await manager.async_refresh()
+
+    assert manager.state == "start_conditions_unavailable"
+    assert not manager.blocks_space_heating
+    assert fake_hass.services.calls == []
+
+
+@pytest.mark.asyncio
+async def test_hot_water_releases_unconfirmed_start_and_does_not_retry_same_window(fake_hass, monkeypatch):
+    manager, clock = _hot_water_start_fixture(fake_hass, monkeypatch)
+    await manager.async_refresh()
+    fake_hass.states.set("input_select.source", "price")
+    fake_hass.states.set("sensor.bus_dhw", "1")
+    clock.now += timedelta(minutes=4)
+    await manager.async_refresh()
+    assert manager.state == "waiting_for_start"
+
+    clock.now += timedelta(minutes=6)
+    await manager.async_refresh()
+    assert manager.state == "start_failed"
+    assert manager.error == "heating_not_started"
+    assert fake_hass.states.get("input_boolean.dhw").state == "off"
+    assert not manager._owned
+    # A protected gateway can retain demand for its minimum-runtime stop delay.
+    assert manager.blocks_space_heating
+    fake_hass.states.set("sensor.bus_dhw", "0")
+    fake_hass.states.set("input_select.source", "none")
+    assert not manager.blocks_space_heating
+
+    writes = len(fake_hass.services.calls)
+    clock.now += timedelta(minutes=1)
+    await manager.async_refresh()
+    assert manager.state == "start_failed"
+    assert len(fake_hass.services.calls) == writes
+
+
+@pytest.mark.asyncio
+async def test_hot_water_native_activity_confirms_start_and_target_ends_request(fake_hass, monkeypatch):
+    manager, clock = _hot_water_start_fixture(fake_hass, monkeypatch)
+    await manager.async_refresh()
+    fake_hass.states.set("input_select.source", "price")
+    fake_hass.states.set("binary_sensor.actual_dhw", "on")
+    clock.now += timedelta(minutes=4)
+    await manager.async_refresh()
+    assert manager.state == "heating"
+    assert manager.attributes["heating_confirmed"] is True
+
+    clock.now += timedelta(minutes=10)
+    await manager.async_refresh()
+    assert manager._owned
+    assert manager.error is None
+    fake_hass.states.set("sensor.tank", "55")
+    await manager.async_refresh()
+    assert not manager._owned
+    assert fake_hass.states.get("input_boolean.dhw").state == "off"
+    assert manager.attributes["request_started_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_hot_water_does_not_start_without_configured_activity_feedback(fake_hass, monkeypatch):
+    manager, _clock = _hot_water_start_fixture(fake_hass, monkeypatch)
+    fake_hass.states.set("binary_sensor.actual_dhw", "unavailable")
+    await manager.async_refresh()
+    assert not manager._owned
+    assert fake_hass.services.calls == []
+
+
+@pytest.mark.asyncio
+async def test_hot_water_restarted_pending_request_still_times_out(fake_hass, monkeypatch):
+    manager, clock = _hot_water_start_fixture(fake_hass, monkeypatch)
+    fake_hass.states.set("input_boolean.dhw", "on")
+    fake_hass.states.set("input_select.source", "price")
+    fake_hass.states.set("input_number.target", "55")
+    fake_hass.states.get("input_datetime.start").attributes = {"timestamp": clock.now.timestamp()-720}
+    await manager.async_refresh()
+    assert manager.state == "start_failed"
+    assert manager.error == "heating_not_started"
+    assert fake_hass.states.get("input_boolean.dhw").state == "off"
+
+
+@pytest.mark.parametrize("activity,blocked", [("off", False), ("on", True), ("unavailable", True)])
+def test_hot_water_verification_signal_also_protects_native_priority(fake_hass, activity, blocked):
+    from custom_components.thermozona.hot_water import HotWaterManager
+
+    controller = HeatPumpController(fake_hass, _config())
+    controller.hot_water = HotWaterManager(fake_hass, {
+        "demand_entity": "input_boolean.dhw",
+        "heating_active_sensor": "binary_sensor.actual_dhw",
+    })
+    fake_hass.states.set("input_boolean.dhw", "off")
+    fake_hass.states.set("binary_sensor.actual_dhw", activity)
+    thermostat = _create_thermostat(fake_hass, controller)
+    assert controller.space_heating_suspended is blocked
+    for mode in ["heat", "cool"]:
+        assert (thermostat._resolve_effective_mode(mode) == HVACMode.OFF) is blocked
+
+
+@pytest.mark.parametrize("minutes", ["nan", "inf", 4, 31])
+def test_hot_water_schema_rejects_invalid_start_timeout(minutes):
+    hot_water = _smart_hot_water_config()
+    hot_water["start_timeout_minutes"] = minutes
+    with pytest.raises(vol.Invalid):
+        thermozona.CONFIG_SCHEMA({"thermozona": _config(hot_water=hot_water)})
+
+
+@pytest.mark.asyncio
+async def test_smart_hot_water_does_not_guess_usage_when_history_fails(fake_hass, monkeypatch):
+    from custom_components.thermozona import hot_water as module
+    monkeypatch.setattr(module, "async_temperature_history", AsyncMock(side_effect=RuntimeError("history offline")))
+    manager = module.HotWaterManager(fake_hass, _smart_hot_water_config())
+    manager._prices.async_refresh = AsyncMock()
+    now = datetime.now(timezone.utc)
+    manager._prices._slots = [PriceSlot(now, now+timedelta(hours=24), .1)]
+    await manager._refresh_usage(now)
+    assert not manager._usage.periods
+    assert manager._smart_window(manager._prices._slots, now) is None
+    assert manager._usage_error == "usage_history_unavailable"
+    assert fake_hass.services.calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduled_comfort_restores_from_saved_baseline_and_tracks_schedule(fake_hass, monkeypatch):
+    from custom_components.thermozona import thermostat as module
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("schedule.work", "on")
+    fake_hass.states.set("sensor.living", "20")
+    thermostat = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work")
+    thermostat.async_get_last_state = AsyncMock(return_value=SimpleNamespace(
+        state="auto", attributes={"temperature": 19, "comfort_temperature": 20}))
+    remover = Mock()
+    tracker = Mock(return_value=remover)
+    monkeypatch.setattr(module, "async_track_state_change_event", tracker)
+    await thermostat.async_added_to_hass()
+    assert thermostat.target_temperature == 19
+    assert thermostat._attr_target_temperature == 20
+    assert any(call.args[1] == ["sensor.living", "schedule.work"] for call in tracker.call_args_list)
+    await controller.async_shutdown()
+    await thermostat.async_will_remove_from_hass()
+    assert remover.called
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", -1, 6])
+def test_setback_schema_rejects_invalid_offsets(value):
+    config = _config()
+    config["zones"]["living_room"]["setback_c"] = value
+    with pytest.raises(vol.Invalid):
+        thermozona.CONFIG_SCHEMA({"thermozona": config})
+
+
+@pytest.mark.asyncio
+async def test_recovery_restores_normal_comfort_early_without_price_boost(fake_hass, monkeypatch):
+    from custom_components.thermozona import thermostat as module
+    from custom_components.thermozona.room_recovery import HeatingRate
+    from custom_components.thermozona.hot_water import HotWaterManager
+    now = datetime(2026, 11, 9, 15, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, "datetime", SimpleNamespace(now=lambda _tz: now))
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", "heat")
+    fake_hass.states.set("sensor.living", "19")
+    fake_hass.states.set("sensor.outside", "10")
+    fake_hass.states.set("schedule.work", "on")
+    fake_hass.states.get("schedule.work").attributes = {"next_event": now+timedelta(hours=2)}
+    thermostat = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work",
+        price_charging=True, schedule_recovery={"enabled": True})
+    thermostat._recovery.profile = HeatingRate(.4, 10, 3)
+    assert thermostat.recovery_plan.active
+    assert thermostat.target_temperature == 20
+    assert thermostat._attr_target_temperature == 20
+    assert thermostat.price_charging_boost == 0
+    # Early recovery is still ordinary demand, subject to the boiler interlock.
+    controller.hot_water = HotWaterManager(fake_hass, {"demand_entity": "input_boolean.dhw"})
+    fake_hass.states.set("input_boolean.dhw", "on")
+    await thermostat._control_heating()
+    assert fake_hass.states.get("switch.zone_1").state == "off"
+    assert thermostat.extra_state_attributes["recovery_waiting_for_boiler"]
+    await controller.async_shutdown()
+
+
+@pytest.mark.parametrize("mode,manual,current", [
+    ("cool", HVACMode.AUTO, "19"), ("heat", HVACMode.OFF, "19"),
+    ("heat", HVACMode.AUTO, "unavailable"), ("off", HVACMode.AUTO, "19"),
+])
+def test_recovery_cannot_activate_off_cooling_or_missing_sensor(fake_hass, mode, manual, current):
+    controller = HeatPumpController(fake_hass, _config(heat_pump_mode="sensor.mode"))
+    fake_hass.states.set("sensor.mode", mode)
+    fake_hass.states.set("sensor.living", current)
+    fake_hass.states.set("schedule.work", "on")
+    fake_hass.states.get("schedule.work").attributes = {
+        "next_event": datetime.now(timezone.utc)+timedelta(minutes=30)}
+    thermostat = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work",
+        schedule_recovery={"enabled": True})
+    thermostat._manual_mode = manual
+    assert not thermostat.recovery_plan.active
+
+
+@pytest.mark.asyncio
+async def test_recovery_learning_task_is_cancelled_on_removal(fake_hass):
+    controller = HeatPumpController(fake_hass, _config())
+    thermostat = _create_thermostat(fake_hass, controller, setback_schedule="schedule.work",
+        schedule_recovery={"enabled": True})
+    thermostat._recovery_task = asyncio.create_task(asyncio.Event().wait())
+    task = thermostat._recovery_task
+    await thermostat.async_prepare_shutdown()
+    assert task.cancelled()
+    assert thermostat._recovery_task is None
+
+
+@pytest.mark.parametrize("field,value", [("max_temperature", 49), ("target_entity", "switch.boiler"),
+                                         ("min_days", 8), ("normal_temperature", "nan")])
+def test_smart_hot_water_schema_rejects_inconsistent_or_invalid_limits(field, value):
+    hot_water = _smart_hot_water_config()
+    hot_water["smart_charging"][field] = value
+    with pytest.raises(vol.Invalid):
+        thermozona.CONFIG_SCHEMA({"thermozona": _config(hot_water=hot_water)})
+
+
+@pytest.mark.asyncio
+async def test_smart_hot_water_skips_price_boost_without_useful_advantage(fake_hass):
+    from custom_components.thermozona.hot_water import HotWaterManager
+    from custom_components.thermozona.thermal_planning import UsagePeriod, UsageProfile
+    manager = HotWaterManager(fake_hass, _smart_hot_water_config())
+    manager._prices.async_refresh = AsyncMock()
+    now = datetime.now(timezone.utc)
+    manager._usage_updated = now
+    manager._usage = UsageProfile((UsagePeriod((now.hour * 60 + now.minute + 240) % 1440, 8, 5),), 7, 5)
+    manager._prices._slots = [PriceSlot(now, now+timedelta(hours=30), .3)]
+    for e, v in [("sensor.tank", "49.8"), ("sensor.soc", "24"), ("input_boolean.dhw", "off"), ("input_select.source", "none"), ("input_datetime.off", "")]:
+        fake_hass.states.set(e, v)
+    fake_hass.states.get("input_datetime.off").attributes = {"timestamp": now.timestamp()-18000}
+    await manager.async_refresh()
+    assert manager.state == "no_economic_window"
+    assert not manager._owned
+    assert manager.window is None
+    assert fake_hass.services.calls == []
+
+
+@pytest.mark.asyncio
+async def test_hot_water_does_not_request_heat_if_disabled_during_history_fetch(fake_hass):
+    from custom_components.thermozona.hot_water import HotWaterManager
+    manager = HotWaterManager(fake_hass, _smart_hot_water_config())
+    entered, resume = asyncio.Event(), asyncio.Event()
+    manager._prices.async_refresh = AsyncMock()
+    async def pending_history(_now):
+        entered.set()
+        await resume.wait()
+    manager._refresh_usage = pending_history
+    refreshing = asyncio.create_task(manager.async_refresh())
+    await entered.wait()
+    disabling = asyncio.create_task(manager.async_set_mode("off"))
+    await asyncio.sleep(0)
+    resume.set()
+    await asyncio.gather(refreshing, disabling)
+    assert manager.state == "off"
+    assert not manager._owned
+    assert fake_hass.services.calls == []

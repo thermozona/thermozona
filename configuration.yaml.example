@@ -56,12 +56,51 @@ input_boolean:
 # Thermozona configuratie
 # Safety notice: Use at your own risk; ensure code-compliant installation/wiring. Authors/contributors are not liable for damage, injury, or fire.
 thermozona:
+  # Optional bounded heating correction from actual supply water and weather.
+  # thermal_compensation:
+  #   enabled: true
+  #   supply_sensor: sensor.heatpump_heating_out
+  #   reference_supply_c: 25.0
+  #   reference_outside_c: 10.0
+  #   max_sensor_age_minutes: 30
+  #   solar_forecast_sensor: sensor.outdoor_solar_forecast_2h
+  #   solar_gain_per_w_m2: 0.002
   outside_temp_sensor: sensor.test_buiten_temperatuur
   # heating_base_offset: 3.0
   # weather_slope_heat: 0.25
   # auto_heat_lockout_above_c: 18.0
   # auto_cool_lockout_below_c: 20.0
   # auto_min_changeover_minutes: 30
+  # Optional shared PWM windows for a heat pump with small zone loads.
+  # Give participating PWM zones the same pwm_cycle_time, e.g. 30 minutes.
+  # pwm_staggering: false
+  # demand_off_delay_minutes: 0
+
+  # Optional Tibber-based house charging: inspect the plan before choosing auto.
+  # price_charging:
+  #   mode: preview
+  #   boost_c: 0.5
+  #   charge_hours: 3
+  #   coast_hours: 6
+  #   min_price_spread: 0.03
+  #   thermal_model:
+  #     normal_cop: 5.0
+  #     charge_cop: 4.5
+  #     loss_percent_per_hour: 1.0
+  #     min_saving_percent: 5
+
+  # Optional hot-water start checks (add the gateway options from README).
+  # hot_water:
+  #   heating_active_sensor: binary_sensor.heatpump_dhw_demand_internal
+  #   start_timeout_minutes: 10
+  #   smart_charging:
+  #     target_entity: input_number.hot_water_charge_target
+  #     start_differential_sensor: sensor.heatpump_delta_t_start_dhw
+  #     normal_temperature: 50
+  #     max_temperature: 55
+  #     thermal_model:
+  #       normal_cop: 3.0
+  #       charge_cop: 2.5
 
   # Optional flow calculation tuning.
   # Keep it small here; see README for the full tuning matrix.
@@ -91,6 +130,16 @@ thermozona:
       # floor_material: wood
       # cooling_dewpoint_margin: 2.0
       # cooling_dewpoint_protection: true
+      # price_charging: true
+      # setback_schedule: schedule.office_away
+      # setback_c: 1.0
+      # Optional learned warm-up before the schedule period ends.
+      # schedule_recovery:
+      #   enabled: true
+      #   fallback_minutes: 120
+      #   max_minutes: 180
+      #   buffer_minutes: 15
+      #   history_days: 7
       # For an air-coil zone, use zone_type: air_coil and set its water sensors:
       # air_coil_requested_water_sensor: sensor.thermozona_flow_temperature
       # air_coil_measured_water_sensor: sensor.heat_pump_supply_temperature

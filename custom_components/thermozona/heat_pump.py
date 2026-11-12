@@ -5,6 +5,7 @@ import asyncio
 import logging
 import math
 import weakref
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -21,6 +22,7 @@ from . import (
     CONF_COOLING_DEWPOINT_MARGIN,
     CONF_COOLING_DEWPOINT_SENSOR,
     CONF_COOLING_FLOOR_DEWPOINT_MARGIN,
+    CONF_DEMAND_OFF_DELAY_MINUTES,
     CONF_FLOW_CURVE_OFFSET,
     CONF_FLOW_TEMP_SENSOR,
     CONF_HEAT_PUMP_MODE,
@@ -32,6 +34,10 @@ from . import (
     CONF_PRO_PREHEAT_FORECAST_SENSOR,
     CONF_PRO_PREHEAT_SOLAR_SENSOR,
     CONF_OUTSIDE_TEMP_SENSOR,
+    CONF_PRICE_CHARGING,
+    CONF_PWM_STAGGERING,
+    CONF_HOT_WATER,
+    CONF_THERMAL_COMPENSATION,
     CONF_WEATHER_SLOPE_COOL,
     CONF_WEATHER_SLOPE_HEAT,
     CONF_WRITE_DEADBAND_C,
@@ -42,6 +48,7 @@ from . import (
     DEFAULT_COOLING_AIR_COIL_ONLY_OFFSET,
     DEFAULT_COOLING_DEHUMIDIFICATION_MIN_FLOW,
     DEFAULT_COOLING_FLOOR_DEWPOINT_MARGIN,
+    DEFAULT_DEMAND_OFF_DELAY_MINUTES,
     DEFAULT_AUTO_COOL_LOCKOUT_BELOW_C,
     DEFAULT_AUTO_HEAT_LOCKOUT_ABOVE_C,
     DEFAULT_AUTO_MIN_CHANGEOVER_MINUTES,
@@ -49,6 +56,7 @@ from . import (
     DEFAULT_HEATING_BASE_OFFSET,
     DEFAULT_PRO_WRITE_DEADBAND_C,
     DEFAULT_PRO_WRITE_MIN_INTERVAL_MINUTES,
+    DEFAULT_PWM_STAGGERING,
     DEFAULT_WEATHER_SLOPE_COOL,
     DEFAULT_WEATHER_SLOPE_HEAT,
     DOMAIN,
@@ -56,8 +64,11 @@ from . import (
     ZONE_TYPE_AIR_COIL,
 )
 from .helpers import resolve_circuits
+from .hot_water import HotWaterManager
+from .price_charging import PriceChargingManager
 from .pro.flow_curve import FlowCurveRuntimeManager
 from .pro.flow_supervisor import ProFlowSupervisor
+from .thermal_conditions import ThermalCompensation, ThermalReference, compensation
 
 if TYPE_CHECKING:
     from .thermostat import ThermozonaThermostat
@@ -113,7 +124,7 @@ class HeatPumpController:
         self._mode_entity_id: str | None = None
         self._pump_state: str = "idle"
         self._last_any_circuit_on: datetime | None = None
-        self._demand_off_delay = timedelta(minutes=5)
+        self._all_circuits_off_since: datetime | None = None
         self._demand_off_task: asyncio.Task | None = None
         self._shutting_down = False
         self._startup_guard_enabled = False
@@ -124,6 +135,51 @@ class HeatPumpController:
             notify_thermostats=lambda: self._notify_thermostats(),
         )
         self._flow_supervisor = ProFlowSupervisor()
+        self.hot_water = (HotWaterManager(self._hass, entry_config[CONF_HOT_WATER], self._hot_water_changed)
+                          if CONF_HOT_WATER in entry_config else None)
+        self.price_charging = PriceChargingManager(
+            hass, entry_config.get(CONF_PRICE_CHARGING, {}), self._notify_thermostats
+        )
+        self.price_charging.excluded_windows = lambda: (
+            self.hot_water.reserved_windows() if self.hot_water is not None else []
+        )
+
+    @property
+    def _demand_off_delay(self) -> timedelta:
+        """Return the configured hold after the final circuit closes."""
+        return timedelta(minutes=self._entry_config.get(
+            CONF_DEMAND_OFF_DELAY_MINUTES, DEFAULT_DEMAND_OFF_DELAY_MINUTES
+        ))
+
+    @property
+    def status_entity(self) -> str | None:
+        """Return the actual status entity ID for history-based room recovery."""
+        return getattr(self._pump_sensor_entity(), "entity_id", None)
+
+    @property
+    def space_heating_suspended(self) -> bool:
+        """Expose shared-compressor priority without changing the user's mode."""
+        return self.hot_water is not None and self.hot_water.blocks_space_heating
+
+    def _hot_water_changed(self) -> None:
+        self._notify_thermostats()
+        if not self._shutting_down:
+            self._hass.async_create_task(self.async_update_heat_pump_state())
+            self._hass.async_create_task(self.price_charging.async_refresh())
+
+    def get_price_charging_boost(self) -> float:
+        """Allow price headroom only while heating is an available operation."""
+        mode = self.get_operation_mode()
+        if self._shutting_down or self.space_heating_suspended or mode not in {"heat", "auto"}:
+            return 0.0
+        if mode == "auto":
+            outside = self._read_entity_float(self._outside_temp_sensor())
+            maximum = self._entry_config.get(
+                CONF_AUTO_HEAT_LOCKOUT_ABOVE_C, DEFAULT_AUTO_HEAT_LOCKOUT_ABOVE_C
+            )
+            if outside is None or outside > maximum:
+                return 0.0
+        return self.price_charging.boost
 
     def begin_platform_setup(self) -> None:
         """Hold control idle until mode and flow output platforms are ready."""
@@ -168,6 +224,63 @@ class HeatPumpController:
 
     def _flow_config(self) -> dict[str, Any]:
         return self._entry_config.get(CONF_FLOW, {})
+
+    @property
+    def thermal_compensation_config(self) -> dict[str, Any]:
+        """Return the explicitly configured measured-water correction."""
+        return self._entry_config.get(CONF_THERMAL_COMPENSATION, {})
+
+    def thermal_compensation(
+        self, *, room_c: float | None, target_c: float, now: datetime,
+        reference: ThermalReference | None = None,
+        solar_weight: float = 0.0,
+    ) -> ThermalCompensation:
+        """Read fresh measured water and weather; never substitute the flow setpoint."""
+        config = self.thermal_compensation_config
+        if not config.get("enabled"):
+            return ThermalCompensation()
+        if self.space_heating_suspended:
+            return ThermalCompensation(reason="boiler_priority")
+        values = []
+        maximum_age = timedelta(minutes=config.get("max_sensor_age_minutes", 30))
+        for entity in (config.get("supply_sensor"), self._outside_temp_sensor()):
+            state = self._hass.states.get(entity) if entity else None
+            timestamp = getattr(state, "last_reported", None) or getattr(state, "last_updated", None)
+            if not isinstance(timestamp, datetime) or timestamp.tzinfo is None:
+                return ThermalCompensation(reason="missing_timestamp")
+            if not timedelta(minutes=-1) <= now - timestamp <= maximum_age:
+                return ThermalCompensation(reason="stale_conditions")
+            if getattr(state, "attributes", {}).get("unit_of_measurement", "°C") != "°C":
+                return ThermalCompensation(reason="invalid_units")
+            values.append(self._read_entity_float(entity))
+        solar = self._fresh_solar_forecast(now) if solar_weight > 0 else None
+        solar_equivalent = min(
+            1.0, (solar or 0) * config.get("solar_gain_per_w_m2", .002) * solar_weight
+        )
+        result = compensation(
+            supply_c=values[0], outside_c=values[1], room_c=room_c, target_c=target_c,
+            reference=reference or ThermalReference(
+                config.get("reference_supply_c", 25.0),
+                config.get("reference_outside_c", 10.0), target_c,
+            ),
+            solar_equivalent_c=solar_equivalent,
+        )
+        return replace(result, solar_w_m2=solar, solar_equivalent_c=(
+            solar_equivalent if result.reason == "active" else 0.0
+        ))
+
+    def _fresh_solar_forecast(self, now: datetime) -> float | None:
+        """Accept a bounded Celsius-independent irradiance forecast for up to three hours."""
+        entity = self.thermal_compensation_config.get("solar_forecast_sensor")
+        state = self._hass.states.get(entity) if entity else None
+        timestamp = getattr(state, "last_reported", None) or getattr(state, "last_updated", None)
+        if (not isinstance(timestamp, datetime) or timestamp.tzinfo is None
+                or not timedelta(minutes=-1) <= now - timestamp <= timedelta(hours=3)):
+            return None
+        if getattr(state, "attributes", {}).get("unit_of_measurement") not in {"W/m²", "W/m2"}:
+            return None
+        value = self._read_entity_float(entity)
+        return value if value is not None and 0 <= value <= 1500 else None
 
     def _outside_temp_sensor(self) -> str | None:
         return self._entry_config.get(CONF_OUTSIDE_TEMP_SENSOR)
@@ -441,11 +554,16 @@ class HeatPumpController:
             circuits.extend(resolve_circuits(zone_config))
         return circuits
 
+    @property
+    def platform_setup_pending(self) -> bool:
+        """Distinguish a temporary startup hold from an explicit user off command."""
+        return self._startup_guard_enabled and (
+            not self._mode_ready or not self._flow_output_ready
+        )
+
     def get_operation_mode(self) -> str:
         """Return the current heat pump operation mode (heat/cool/auto)."""
-        if self._startup_guard_enabled and (
-            not self._mode_ready or not self._flow_output_ready
-        ):
+        if self.platform_setup_pending:
             return "off"
 
         if self._mode_select_entity() is not None:
@@ -491,6 +609,7 @@ class HeatPumpController:
         *,
         target: float | None,
         current: float | None,
+        cooling_target: float | None = None,
         active: bool | None = None,
         duty_cycle: float | None = None,
         zone_response: str | None = None,
@@ -524,6 +643,9 @@ class HeatPumpController:
         else:
             entry = self._zone_status.setdefault(zone_name, {})
             entry["target"] = float(target)
+            entry["cooling_target"] = max(
+                float(target), float(target if cooling_target is None else cooling_target)
+            )
             entry["current"] = float(current)
             if active is not None:
                 entry["active"] = bool(active)
@@ -604,7 +726,15 @@ class HeatPumpController:
 
         weighted_deltas: list[tuple[float, float]] = []
         for status in self._zone_status.values():
-            delta = float(status["current"]) - float(status["target"])
+            current = float(status["current"])
+            heat_target = float(status["target"])
+            cool_target = float(status.get("cooling_target", heat_target))
+            if current < heat_target:
+                delta = current - heat_target
+            elif current > cool_target:
+                delta = current - cool_target
+            else:
+                continue
             if abs(delta) <= 0.2:
                 continue
             weight = max(0.1, float(status.get("zone_flow_weight", 1.0)))
@@ -1213,13 +1343,16 @@ class HeatPumpController:
         self._thermostats.discard(thermostat)
 
     def get_pwm_zone_info(self, thermostat: ThermozonaThermostat) -> tuple[int, int]:
-        """Return deterministic PWM staggering index and active PWM zone count."""
+        """Return PWM alignment: staggered by default, shared when configured."""
         if getattr(thermostat, "control_mode", None) != CONTROL_MODE_PWM:
             return (0, 0)
 
         zone_index = self._pwm_zone_indices.get(thermostat)
         if zone_index is None:
             return (0, 0)
+
+        if not self._entry_config.get(CONF_PWM_STAGGERING, DEFAULT_PWM_STAGGERING):
+            return (0, 1)
 
         zone_count = sum(
             1
@@ -1244,6 +1377,13 @@ class HeatPumpController:
         """Update the heat pump switch and flow temperature based on circuit state."""
         if self._shutting_down:
             self._last_any_circuit_on = None
+            self._all_circuits_off_since = None
+            self._update_pump_status(False, None)
+            self._mark_flow_command_inactive()
+            return
+        if self.space_heating_suspended:
+            self._last_any_circuit_on = None
+            self._all_circuits_off_since = None
             self._update_pump_status(False, None)
             self._mark_flow_command_inactive()
             return
@@ -1266,41 +1406,49 @@ class HeatPumpController:
                     self._demand_off_task.cancel()
                     self._demand_off_task = None
                 self._last_any_circuit_on = now
+                self._all_circuits_off_since = None
                 effective_mode = await self._async_set_flow_temperature()
                 self._update_pump_status(True, effective_mode)
                 if effective_mode is None:
                     self._mark_flow_command_inactive()
-            elif (
+                return
+
+            if (
                 not force_idle
                 and self.get_operation_mode() != "off"
                 and self._last_any_circuit_on is not None
-                and now - self._last_any_circuit_on < self._demand_off_delay
             ):
-                _LOGGER.debug(
-                    "%s: All circuits off, but within %s delay — keeping demand",
-                    DOMAIN,
-                    self._demand_off_delay,
-                )
-                self._schedule_demand_off_recheck(now)
-            else:
-                if self._demand_off_task is not None:
-                    self._demand_off_task.cancel()
-                    self._demand_off_task = None
-                self._last_any_circuit_on = None
-                self._update_pump_status(False, None)
-                self._mark_flow_command_inactive()
+                if self._all_circuits_off_since is None:
+                    self._all_circuits_off_since = now
+                if now - self._all_circuits_off_since < self._demand_off_delay:
+                    _LOGGER.debug(
+                        "%s: All circuits off, but within %s delay — keeping demand",
+                        DOMAIN,
+                        self._demand_off_delay,
+                    )
+                    self._schedule_demand_off_recheck(now)
+                    return
+
+            if self._demand_off_task is not None:
+                self._demand_off_task.cancel()
+                self._demand_off_task = None
+            self._last_any_circuit_on = None
+            self._all_circuits_off_since = None
+            self._update_pump_status(False, None)
+            self._mark_flow_command_inactive()
         except Exception as exc:  # pragma: no cover - defensive logging
             _LOGGER.error("%s: Error updating heat pump state: %s", DOMAIN, exc)
             self._last_any_circuit_on = None
+            self._all_circuits_off_since = None
             self._update_pump_status(False, None)
             self._mark_flow_command_inactive()
 
     def _schedule_demand_off_recheck(self, now: datetime) -> None:
         """Re-evaluate when the demand off-delay expires."""
-        if self._last_any_circuit_on is None or self._demand_off_task is not None:
+        if self._all_circuits_off_since is None or self._demand_off_task is not None:
             return
 
-        remaining = self._demand_off_delay - (now - self._last_any_circuit_on)
+        remaining = self._demand_off_delay - (now - self._all_circuits_off_since)
         delay_seconds = max(1.0, remaining.total_seconds())
 
         async def _recheck() -> None:
@@ -1426,6 +1574,9 @@ class HeatPumpController:
     async def async_shutdown(self) -> None:
         """Close all circuits and clear demand before unload or reload."""
         self._shutting_down = True
+        await self.price_charging.async_stop()
+        if self.hot_water is not None:
+            await self.hot_water.async_stop()
         if self._demand_off_task is not None:
             self._demand_off_task.cancel()
             self._demand_off_task = None
@@ -1454,12 +1605,21 @@ class HeatPumpController:
 
         self._zone_status.clear()
         self._last_any_circuit_on = None
+        self._all_circuits_off_since = None
         self._update_pump_status(False, None)
         self._mark_flow_command_inactive()
 
     def refresh_entry_config(self, entry_config: dict[str, Any]) -> None:
         """Update internal reference to the config entry (for reload scenarios)."""
         self._entry_config = entry_config
+        self.hot_water = (HotWaterManager(self._hass, entry_config[CONF_HOT_WATER], self._hot_water_changed)
+                          if CONF_HOT_WATER in entry_config else None)
+        self.price_charging = PriceChargingManager(
+            self._hass, entry_config.get(CONF_PRICE_CHARGING, {}), self._notify_thermostats
+        )
+        self.price_charging.excluded_windows = lambda: (
+            self.hot_water.reserved_windows() if self.hot_water is not None else []
+        )
         self._flow_supervisor.reset()
         self._last_flow_write_temp = None
         self._last_flow_write_time = None

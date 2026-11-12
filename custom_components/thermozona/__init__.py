@@ -1,4 +1,6 @@
 """Thermozona integration entrypoint."""
+import math
+
 from homeassistant.config import async_hass_config_yaml
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.config_entries import ConfigEntry, SOURCE_IMPORT
@@ -62,11 +64,29 @@ CONF_PWM_MIN_OFF_TIME = "pwm_min_off_time"
 CONF_PWM_KP = "pwm_kp"
 CONF_PWM_KI = "pwm_ki"
 CONF_PWM_ACTUATOR_DELAY = "pwm_actuator_delay"
+CONF_PWM_STAGGERING = "pwm_staggering"
+CONF_DEMAND_OFF_DELAY_MINUTES = "demand_off_delay_minutes"
 CONF_ZONE_RESPONSE = "zone_response"
 CONF_ZONE_FLOW_WEIGHT = "zone_flow_weight"
 CONF_ZONE_HEATING_MIN_FLOW = "heating_min_flow_c"
 CONF_ZONE_SOLAR_WEIGHT = "zone_solar_weight"
 CONF_ZONE_TYPE = "zone_type"
+CONF_PRICE_CHARGING = "price_charging"
+CONF_HOT_WATER = "hot_water"
+CONF_HOT_WATER_START_DIFFERENTIAL_SENSOR = "start_differential_sensor"
+CONF_HOT_WATER_HEATING_ACTIVE_SENSOR = "heating_active_sensor"
+CONF_HOT_WATER_START_TIMEOUT_MINUTES = "start_timeout_minutes"
+DEFAULT_HOT_WATER_START_TIMEOUT_MINUTES = 10
+CONF_PRICE_MODE = "mode"
+CONF_PRICE_HOME = "home"
+CONF_PRICE_BOOST = "boost_c"
+CONF_PRICE_CHARGE_HOURS = "charge_hours"
+CONF_PRICE_COAST_HOURS = "coast_hours"
+CONF_PRICE_MIN_SPREAD = "min_price_spread"
+DEFAULT_PRICE_BOOST = 0.5
+DEFAULT_PRICE_CHARGE_HOURS = 3.0
+DEFAULT_PRICE_COAST_HOURS = 6.0
+DEFAULT_PRICE_MIN_SPREAD = 0.03
 CONF_AIR_COIL_REQUESTED_WATER_SENSOR = "air_coil_requested_water_sensor"
 CONF_AIR_COIL_MEASURED_WATER_SENSOR = "air_coil_measured_water_sensor"
 CONF_FLOOR_MATERIAL = "floor_material"
@@ -124,6 +144,10 @@ DEFAULT_ZONE_SOLAR_WEIGHT = 1.0
 DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR = "sensor.thermozona_flow_temperature"
 DEFAULT_AIR_COIL_MEASURED_WATER_SENSOR = "sensor.heatpump_heating_out"
 CONF_HYSTERESIS = "hysteresis"
+CONF_SETBACK_SCHEDULE = "setback_schedule"
+CONF_SETBACK_C = "setback_c"
+CONF_SCHEDULE_RECOVERY = "schedule_recovery"
+CONF_THERMAL_COMPENSATION = "thermal_compensation"
 
 DEFAULT_CONTROL_MODE = CONTROL_MODE_BANG_BANG
 DEFAULT_PWM_CYCLE_TIME = 15
@@ -132,6 +156,8 @@ DEFAULT_PWM_MIN_OFF_TIME = 3
 DEFAULT_PWM_KP = 30.0
 DEFAULT_PWM_KI = 2.0
 DEFAULT_PWM_ACTUATOR_DELAY = 3
+DEFAULT_PWM_STAGGERING = True
+DEFAULT_DEMAND_OFF_DELAY_MINUTES = 5.0
 
 FLOW_SCHEMA = vol.Schema(
     {
@@ -250,10 +276,64 @@ FLOW_SCHEMA = vol.Schema(
     }
 )
 
+def _finite_float(value: object) -> float:
+    """Reject nonfinite numeric configuration before it reaches control logic."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise vol.Invalid("Value must be finite")
+    return number
+
+
+def _validate_recovery(config: dict) -> dict:
+    """Keep fallback and safety allowance within the configured hard limit."""
+    if max(config["fallback_minutes"], config["buffer_minutes"]) > config["max_minutes"]:
+        raise vol.Invalid("Recovery fallback and buffer cannot exceed max_minutes")
+    return config
+
+
+RECOVERY_SCHEMA = vol.All(vol.Schema({
+    vol.Optional("enabled", default=False): cv.boolean,
+    vol.Optional("fallback_minutes", default=120): vol.All(vol.Coerce(int), vol.Range(min=5, max=360)),
+    vol.Optional("max_minutes", default=180): vol.All(vol.Coerce(int), vol.Range(min=15, max=360)),
+    vol.Optional("buffer_minutes", default=15): vol.All(vol.Coerce(int), vol.Range(min=5, max=60)),
+    vol.Optional("history_days", default=7): vol.All(vol.Coerce(int), vol.Range(min=2, max=14)),
+}), _validate_recovery)
+
+
+def _validate_thermal_compensation(config: dict) -> dict:
+    """Require a measured sensor before opting in to water/weather correction."""
+    if config["enabled"] and not config.get("supply_sensor"):
+        raise vol.Invalid("Enabled thermal_compensation requires supply_sensor")
+    if config["reference_supply_c"] <= 20:
+        raise vol.Invalid("reference_supply_c must exceed a normal room temperature")
+    return config
+
+
+THERMAL_COMPENSATION_SCHEMA = vol.All(vol.Schema({
+    vol.Optional("enabled", default=False): cv.boolean,
+    vol.Optional("supply_sensor"): cv.entity_id,
+    vol.Optional("reference_supply_c", default=25.0): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=21, max=40)),
+    vol.Optional("reference_outside_c", default=10.0): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=-20, max=20)),
+    vol.Optional("max_sensor_age_minutes", default=30): vol.All(
+        vol.Coerce(int), vol.Range(min=5, max=120)),
+    vol.Optional("solar_forecast_sensor"): cv.entity_id,
+    vol.Optional("solar_gain_per_w_m2", default=0.002): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=0, max=0.01)),
+}), _validate_thermal_compensation)
+
+
 ZONE_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_CIRCUITS): [cv.entity_id],
         vol.Required(CONF_TEMP_SENSOR): cv.entity_id,
+        vol.Optional(CONF_PRICE_CHARGING, default=False): cv.boolean,
+        vol.Optional(CONF_SETBACK_SCHEDULE): cv.entity_id,
+        vol.Optional(CONF_SETBACK_C, default=1.0): vol.All(
+            vol.Coerce(_finite_float), vol.Range(min=0, max=5)
+        ),
+        vol.Optional(CONF_SCHEDULE_RECOVERY, default={}): RECOVERY_SCHEMA,
         vol.Optional(CONF_HYSTERESIS): vol.All(
             vol.Coerce(float),
             vol.Range(min=0, max=5),
@@ -325,11 +405,89 @@ ZONE_SCHEMA = vol.Schema(
     }
 )
 
+THERMAL_MODEL_SCHEMA = vol.Schema({
+    vol.Required("charge_cop"): vol.All(vol.Coerce(_finite_float), vol.Range(min=1, max=15)),
+    vol.Required("normal_cop"): vol.All(vol.Coerce(_finite_float), vol.Range(min=1, max=15)),
+    vol.Optional("loss_percent_per_hour", default=1.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=0, max=20)),
+    vol.Optional("min_saving_percent", default=5.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=0, max=90)),
+    vol.Optional("full_charge_saving_percent", default=25.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=1, max=100)),
+})
+
+SMART_HOT_WATER_SCHEMA = vol.Schema({
+    vol.Required("target_entity"): cv.entity_id,
+    vol.Optional(CONF_HOT_WATER_START_DIFFERENTIAL_SENSOR): cv.entity_id,
+    vol.Required("thermal_model"): THERMAL_MODEL_SCHEMA,
+    vol.Optional("normal_temperature", default=50.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=45, max=65)),
+    vol.Optional("max_temperature", default=55.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=45, max=65)),
+    vol.Optional("min_boost_c", default=2.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=0.5, max=10)),
+    vol.Optional("history_days", default=7): vol.All(vol.Coerce(int), vol.Range(min=3, max=14)),
+    vol.Optional("min_days", default=3): vol.All(vol.Coerce(int), vol.Range(min=3, max=14)),
+    vol.Optional("max_storage_hours", default=12.0): vol.All(vol.Coerce(_finite_float), vol.Range(min=1, max=24)),
+    vol.Optional("min_price_spread", default=0.03): vol.All(vol.Coerce(_finite_float), vol.Range(min=0, max=2)),
+})
+
+
+def _validate_smart_hot_water(config: dict) -> dict:
+    """Reject contradictory limits and unsupported target output domains."""
+    if config["normal_temperature"] > config["max_temperature"]:
+        raise vol.Invalid("max_temperature must be at least normal_temperature")
+    if config["min_boost_c"] > config["max_temperature"] - config["normal_temperature"]:
+        raise vol.Invalid("min_boost_c exceeds available temperature headroom")
+    if config["min_days"] > config["history_days"]:
+        raise vol.Invalid("min_days cannot exceed history_days")
+    if config["target_entity"].split(".")[0] not in {"input_number", "number"}:
+        raise vol.Invalid("target_entity must be a number or input_number")
+    return config
+
+PRICE_CHARGING_SCHEMA = vol.Schema({
+    vol.Optional("thermal_model"): THERMAL_MODEL_SCHEMA,
+    vol.Optional(CONF_PRICE_MODE, default="off"): vol.In(["off", "preview", "auto"]),
+    vol.Optional(CONF_PRICE_HOME): cv.string,
+    vol.Optional(CONF_PRICE_BOOST, default=DEFAULT_PRICE_BOOST): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=0, max=2)
+    ),
+    vol.Optional(CONF_PRICE_CHARGE_HOURS, default=DEFAULT_PRICE_CHARGE_HOURS): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=0.5, max=6)
+    ),
+    vol.Optional(CONF_PRICE_COAST_HOURS, default=DEFAULT_PRICE_COAST_HOURS): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=1, max=12)
+    ),
+    vol.Optional(CONF_PRICE_MIN_SPREAD, default=DEFAULT_PRICE_MIN_SPREAD): vol.All(
+        vol.Coerce(_finite_float), vol.Range(min=0, max=10)
+    ),
+})
+
+HOT_WATER_SCHEMA = vol.Schema({
+    vol.Optional("smart_charging"): vol.All(SMART_HOT_WATER_SCHEMA, _validate_smart_hot_water),
+    **{vol.Required(key): cv.entity_id for key in (
+        "temperature_sensor", "soc_sensor", "demand_entity", "source_entity",
+        "last_off_entity", "started_at_entity",
+    )},
+    vol.Optional("grid_sensor"): cv.entity_id,
+    vol.Optional("active_sensors", default=[]): [cv.entity_id],
+    vol.Optional(CONF_HOT_WATER_HEATING_ACTIVE_SENSOR): cv.entity_id,
+    vol.Optional(
+        CONF_HOT_WATER_START_TIMEOUT_MINUTES,
+        default=DEFAULT_HOT_WATER_START_TIMEOUT_MINUTES,
+    ): vol.All(vol.Coerce(_finite_float), vol.Range(min=5, max=30)),
+    vol.Required("start_service"): cv.string,
+    vol.Required("stop_service"): cv.string,
+    vol.Optional("start_data", default={}): dict,
+    vol.Optional("stop_data", default={}): dict,
+    vol.Optional("mode", default="monitor"): vol.In(["off", "monitor", "auto"]),
+})
+
 CONFIG_SCHEMA = vol.Schema({
     DOMAIN: vol.Schema({
         vol.Required(CONF_OUTSIDE_TEMP_SENSOR): cv.entity_id,
         vol.Optional(CONF_FLOW_TEMP_SENSOR): cv.entity_id,
         vol.Optional(CONF_HEAT_PUMP_MODE): cv.entity_id,
+        vol.Optional(
+            CONF_PWM_STAGGERING, default=DEFAULT_PWM_STAGGERING
+        ): cv.boolean,
+        vol.Optional(
+            CONF_DEMAND_OFF_DELAY_MINUTES, default=DEFAULT_DEMAND_OFF_DELAY_MINUTES
+        ): vol.All(vol.Coerce(_finite_float), vol.Range(min=0, max=30)),
         vol.Optional(
             CONF_HEATING_BASE_OFFSET,
             default=DEFAULT_HEATING_BASE_OFFSET,
@@ -366,6 +524,9 @@ CONFIG_SCHEMA = vol.Schema({
             CONF_FLOW,
             default={},
         ): FLOW_SCHEMA,
+        vol.Optional(CONF_PRICE_CHARGING, default={}): PRICE_CHARGING_SCHEMA,
+        vol.Optional(CONF_HOT_WATER): HOT_WATER_SCHEMA,
+        vol.Optional(CONF_THERMAL_COMPENSATION, default={}): THERMAL_COMPENSATION_SCHEMA,
         vol.Required(CONF_ZONES): {
             cv.string: ZONE_SCHEMA
         }
@@ -459,6 +620,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     controller.begin_platform_setup()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    await controller.price_charging.async_start()
+    if controller.hot_water is not None:
+        await controller.hot_water.async_start()
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

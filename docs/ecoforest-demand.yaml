@@ -1,0 +1,127 @@
+# Example package: use instead of separate mode and flow automations.
+automation:
+  - alias: "Drive Ecoforest mode and setpoint from Thermozona"
+    description: "Synchronize demand and setpoint; stop before changing direction."
+    mode: queued
+    max: 10
+    trigger:
+      - platform: homeassistant
+        event: start
+      - platform: state
+        entity_id:
+          - sensor.thermozona_heat_pump_status
+          - number.thermozona_flow_temperature
+        to:
+      - platform: state
+        entity_id: sensor.thermozona_flow_temperature
+        attribute: command_active
+      - platform: state
+        entity_id: sensor.thermozona_flow_temperature
+        attribute: effective_mode
+      - platform: time_pattern
+        minutes: "/5"
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('sensor.thermozona_heat_pump_status') in ['heat', 'cool', 'idle', 'off'] }}
+    action:
+      - variables:
+          controller_status: "{{ states('sensor.thermozona_heat_pump_status') }}"
+          command_mode: "{{ state_attr('sensor.thermozona_flow_temperature', 'effective_mode') }}"
+          command_active: "{{ state_attr('sensor.thermozona_flow_temperature', 'command_active') == true }}"
+          flow_valid: "{{ has_value('number.thermozona_flow_temperature') }}"
+          flow_temperature: "{{ states('number.thermozona_flow_temperature') | float(0) }}"
+          current_mode: "{{ states('sensor.heatpump_bus_dg1_demand') | int(-1) }}"
+          expected_mode: >-
+            {% if controller_status == 'heat' %}1
+            {% elif controller_status == 'cool' %}2
+            {% else %}0{% endif %}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ controller_status in ['idle', 'off'] and current_mode != 0 }}
+            sequence:
+              - service: modbus.write_register
+                data:
+                  hub: ecoforest
+                  slave: 17
+                  address: 5224
+                  value: 0
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ controller_status in ['heat', 'cool']
+                     and (not command_active or not flow_valid or command_mode != controller_status) }}
+            sequence:
+              - condition: template
+                value_template: "{{ current_mode != 0 }}"
+              - service: modbus.write_register
+                data:
+                  hub: ecoforest
+                  slave: 17
+                  address: 5224
+                  value: 0
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ controller_status in ['heat', 'cool']
+                     and command_active
+                     and flow_valid
+                     and command_mode == controller_status }}
+            sequence:
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: >-
+                          {{ current_mode not in [0, expected_mode | int] }}
+                    sequence:
+                      - service: modbus.write_register
+                        data:
+                          hub: ecoforest
+                          slave: 17
+                          address: 5224
+                          value: 0
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: >-
+                          {{ controller_status == 'cool'
+                             and (states('sensor.heatpump_bus_cooling_dg1_setpoint') | float(-99)
+                                  - flow_temperature | float) | abs >= 0.1 }}
+                    sequence:
+                      - service: modbus.write_register
+                        data:
+                          hub: ecoforest
+                          slave: 17
+                          address: 139
+                          value: "{{ (flow_temperature | float * 10) | round(0) | int }}"
+                  - conditions:
+                      - condition: template
+                        value_template: >-
+                          {{ controller_status == 'heat'
+                             and (states('sensor.heatpump_bus_heating_dg1_setpoint') | float(-99)
+                                  - flow_temperature | float) | abs >= 0.1 }}
+                    sequence:
+                      - service: modbus.write_register
+                        data:
+                          hub: ecoforest
+                          slave: 17
+                          address: 135
+                          value: "{{ (flow_temperature | float * 10) | round(0) | int }}"
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: >-
+                          {{ current_mode != expected_mode | int
+                             and states('sensor.thermozona_heat_pump_status') == controller_status
+                             and state_attr('sensor.thermozona_flow_temperature', 'command_active') == true
+                             and state_attr('sensor.thermozona_flow_temperature', 'effective_mode') == command_mode
+                             and states('number.thermozona_flow_temperature') | float(0) == flow_temperature | float }}
+                    sequence:
+                      - service: modbus.write_register
+                        data:
+                          hub: ecoforest
+                          slave: 17
+                          address: 5224
+                          value: "{{ expected_mode | int }}"

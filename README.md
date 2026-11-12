@@ -25,6 +25,9 @@ Learn more at [thermozona.com](https://thermozona.com).
 - Internal helper entities for heat pump status, flow temperature, flow temperature history, and runtime curve offset.
 - Demand-weighted heating flow calculation with slow/fast zone weighting, slew limiting, preheat forecast, and solar forecast compensation.
 - Dew-point-aware floor cooling, air-coil cooling, and per-zone heating flow minimums.
+- Optional price-aware house charging and coordinated hot-water charging.
+- Per-room setback schedules with learned heating recovery.
+- An optional dashboard card with a room schedule editor.
 
 ## Requirements
 
@@ -97,6 +100,8 @@ After startup you should see:
 - `number.thermozona_flow_temperature`
 - `sensor.thermozona_flow_temperature`
 - `number.thermozona_flow_curve_offset`
+- `select.thermozona_price_charging`
+- `sensor.thermozona_price_charging`
 
 Set a zone target temperature from the climate entity. Thermozona will turn the configured circuit entities on or off based on demand.
 
@@ -185,6 +190,9 @@ thermozona:
 | `zones` | Yes | none | Mapping of zone names to temperature sensors and circuit outputs. |
 | `flow_temp_sensor` | No | internal number entity | Optional external `input_number` target for the calculated flow temperature. |
 | `heat_pump_mode` | No | internal select entity | Optional external entity for heat/cool/auto/off mode. |
+| `pwm_staggering` | No | `true` | Spread PWM zones over their cycles. Set `false` and use the same cycle length to group zone demand into shared heating/cooling windows. |
+| `thermal_compensation` | No | disabled | Bounded measured-water/outdoor correction for heating PWM and scheduled recovery; configure the actual supply sensor explicitly. |
+| `demand_off_delay_minutes` | No | `5` | Hold shared demand after the final circuit closes, range `0` to `30`. Set `0` to release demand immediately; the heat pump retains its native pump run-on and protections. |
 | `heating_base_offset` | No | `3.0` | Base degrees added above the warmest active target in heating. |
 | `cooling_base_offset` | No | `2.5` | Base degrees subtracted below the coolest active target in cooling. |
 | `flow_curve_offset` | No | `0.0` | Baseline offset applied to both heating and cooling flow calculations. |
@@ -201,8 +209,11 @@ thermozona:
 | --- | --- | --- | --- |
 | `temp_sensor` | Yes | none | Room temperature sensor for the zone. |
 | `circuits` | Yes | none | List of switch-like entities controlled by the zone. |
-| `hysteresis` | No | `0.3` | Deadband around the target temperature for `bang_bang` mode. |
+| `hysteresis` | No | `0.3` | Deadband for `bang_bang` mode; maximum overshoot band for PWM comfort protection. |
 | `control_mode` | No | `bang_bang` | `bang_bang` or `pwm`. |
+| `setback_schedule` | No | none | Schedule/helper entity: while on, lower this zone's heating comfort target. Create a UI Schedule helper to edit days and times in Home Assistant. |
+| `setback_c` | No | `1.0` | Scheduled heating reduction in °C, range `0` to `5`. Extra price charging pauses for this zone during setback. |
+| `schedule_recovery` | No | disabled | Optional early return to normal comfort before the absence ends; see below. |
 | `pwm_cycle_time` | No | `15` | PWM cycle length in minutes, range `5` to `30`. |
 | `pwm_min_on_time` | No | `3` | Minimum PWM on time in minutes, range `1` to `10`. |
 | `pwm_min_off_time` | No | `3` | Minimum PWM off time in minutes, range `1` to `10`. |
@@ -320,7 +331,53 @@ Selecting `air_coil_only` closes all floor/wall cooling zones, including zones w
 
 ### Per-Zone Heating Minimums
 
-A wall zone can set `heating_min_flow_c: 32.0`, for example. Its minimum contributes only while its circuit is active and its room remains below target. After the initial command, the shared command ramps up by at most 1.5°C and down by at most 2°C per five minutes, alongside the normal heating curve slew limits.
+A wall zone can set `heating_min_flow_c: 32.0`, for example. A floor zone that cannot reach comfort at the normal curve can also use a modest minimum. Its minimum contributes only while its circuit is active and its room remains below target. After the initial command, the shared command ramps up by at most 1.5°C and down by at most 2°C per five minutes, alongside the normal heating curve slew limits.
+
+### Charge the House During Cheaper Electricity Periods
+
+Price charging temporarily raises the effective heating target of selected floor zones. Your normal climate target remains the comfort target, including after a restart. When charging ends, zones return to that target and use the accumulated warmth. The planner never lowers the comfort target or prevents normal heating during expensive periods.
+
+This optional feature uses the installed Home Assistant Tibber integration and its `tibber.get_prices` action. No additional account token is stored in Thermozona. Price charging is off by default and each participating floor zone must opt in:
+
+```yaml
+thermozona:
+  price_charging:
+    mode: preview
+    boost_c: 0.5
+    charge_hours: 3
+    coast_hours: 6
+    min_price_spread: 0.03
+    # home: My home  # Required only when Tibber returns multiple homes.
+  zones:
+    living_room:
+      temp_sensor: sensor.living_room_temperature
+      circuits:
+        - switch.manifold_living
+      price_charging: true
+```
+
+Merge this into your existing configuration. `select.thermozona_price_charging` offers:
+
+- `off`: normal operation, with no price-related target adjustment.
+- `preview`: fetch prices and display a plan while keeping normal targets.
+- `auto`: apply temporary headroom during the selected charging block.
+
+The selection is restored across restarts. Start with preview to inspect the plan, then choose auto to use it. By default, the planner selects the cheapest complete, contiguous block starting within the next 24 hours whose average price is sufficiently below the following coast period. With an optional `thermal_model`, it selects the block with the greatest modeled heat-cost advantage after COP and storage loss. It retains an active block through charging and coasting. It uses timezone-aware hourly or quarter-hour intervals, checks coverage, and requests fresh prices hourly. Missing or invalid prices remove the boost and leave normal comfort control running.
+
+| Option under `price_charging` | Default | Description |
+| --- | --- | --- |
+| `mode` | `off` | Initial mode: `off`, `preview`, or `auto`. The UI selection is restored when available. |
+| `home` | only returned home | Tibber home name; required when the response contains multiple homes. |
+| `boost_c` | `0.5` | Extra effective room target in °C, range `0` to `2`, capped by the climate entity maximum. |
+| `charge_hours` | `3` | Contiguous charging window length, range `0.5` to `6` hours. |
+| `coast_hours` | `6` | Following period used for price comparison and the coasting phase, range `1` to `12` hours. |
+| `min_price_spread` | `0.03` | Required average price difference per kWh in the Tibber account currency. |
+
+Only opted-in `floor` zones receive the boost. Manual off, cooling mode, sensor protections, and automatic heating lockouts take precedence. PWM demand is recalculated when headroom changes, and a zone closes at its effective charging target rather than extending its normal hysteresis above that target. Physical room temperature can still overshoot because floors retain heat.
+
+`sensor.thermozona_price_charging` exposes the selected phase, `charge_start`, `charge_end`, average charging/following prices, price freshness, and errors. In preview, `planned_state` shows what auto would do. Each climate entity exposes `price_charging_enabled`, `price_charging_boost_c`, and `effective_target_temperature` alongside its unchanged normal target.
+
+Without a `thermal_model`, the planner compares electricity prices alone. The optional model uses configured COP and storage-loss estimates; it does not measure stored kWh or guarantee bill savings. Existing weather compensation and flow limits remain active; use actual temperature and energy history to tune headroom and window length. See [Heat cost and learned hot-water use](#heat-cost-and-learned-hot-water-use) for model settings.
 
 ### Air-Coil Heating Interlock
 
@@ -337,6 +394,74 @@ This is the default. Thermozona turns circuit outputs on when the room needs hea
 ### `control_mode: pwm`
 
 PWM mode calculates a 0-100% duty cycle each cycle. It is useful for high thermal-mass floors where plain on/off control overshoots.
+
+The integral stops accumulating when it would push an already saturated command
+past 0% or 100%. This avoids building negative demand while a warm room is off.
+If heating takes the room above its effective target plus `hysteresis`, PWM closes
+the circuit immediately and clears accumulated heat demand. Cooling applies the
+same protection below target minus `hysteresis`. The circuit stays closed for
+the rest of that aligned cycle and at least its minimum off time, so a changing
+sensor reading cannot add extra pulses. Diagnostics expose `pwm_comfort_limited`.
+Actuator-delay compensation also retains the configured minimum off time for
+partial requests up to 95%; near-full and full demand can remain continuously on.
+
+Optional measured-water and weather compensation adjusts partial heating demand
+at the start of each PWM cycle:
+
+```yaml
+thermozona:
+  thermal_compensation:
+    enabled: true
+    supply_sensor: sensor.heatpump_heating_out
+    reference_supply_c: 25.0
+    reference_outside_c: 10.0
+    max_sensor_age_minutes: 30
+    # Optional forecast in W/m², not PV electricity in W:
+    solar_forecast_sensor: sensor.outdoor_solar_forecast_2h
+    solar_gain_per_w_m2: 0.002
+```
+
+Use a sensor that measures water actually supplied to the room circuits, not the
+calculated flow setpoint or boiler temperature. Select references appropriate
+to the conditions for which the existing gains were tuned. The estimate compares
+outdoor heat loss (`room target - outside`) with water delivery
+(`measured supply - room`), relative to these references. Their combined factor
+is limited to 0.75–1.25. Hotter water reduces partial demand and colder weather
+increases it; hotter weather-compensated water counteracts the increased load.
+This trims the existing PI command, rather than adding a second weather curve:
+`trim = duty * (factor - 1) * (1 - duty / 100)`. Zero and 100% requests remain
+unchanged, so compensation cannot prevent an underheated room requesting full
+heat. PI integral limits and actuator timing still apply. Sensor updates do not
+restart cycles or introduce extra valve pulses.
+
+Missing, nonfinite, stale, non-Celsius or implausible water/weather readings
+retain ordinary PI control. Water outside 15–45°C, or less than 1°C warmer than
+the room, is unsuitable for this estimate. Freshness uses `last_reported` when
+available. Cooling and air-coil controls retain their existing behavior, and
+boiler priority and all existing interlocks remain authoritative. This is a
+bounded delivery/loss estimate, not a measured heat output or efficiency model.
+
+Climate diagnostics expose `pwm_thermal_factor`, `pwm_measured_supply_c`,
+`pwm_outside_c`, and `pwm_thermal_compensation` for the applied cycle.
+
+Startup platform holds, waiting for the first room reading, and boiler-priority pauses freeze the saved PI integral
+while keeping valves closed. Paused time is excluded from integration when
+control resumes. Explicit off and invalid room temperatures after the first valid reading still clear the
+integral. `pwm_integral_mode` records its heating/cooling direction; changing
+direction resets the integral and starts a fresh PWM cycle.
+
+An optional `solar_forecast_sensor` can soften partial PWM heating when the room
+is within 0.3°C of comfort. It uses the existing `zone_solar_weight` (zero means
+shaded) and `solar_gain_per_w_m2`, capped at a 1°C equivalent reduction in outdoor
+load, within the same overall factor bounds. Full heat demand stays intact.
+Forecast readings must be finite, 0–1500 W/m², in `W/m²` or `W/m2`, and reported
+within three hours. Invalid/missing forecasts leave water/weather correction
+available. The central solar forecast continues to soften its cold-weather
+preheat boost. These are forecast-based estimates of exposure, not measurements
+of sunlight entering each room. Diagnostics expose `pwm_solar_forecast_w_m2` and
+`pwm_solar_correction_c`.
+
+For a shared heat pump with small zone loads, staggered pulses can keep circulation active nearly continuously. Set `pwm_staggering: false` at the `thermozona` level and use a common `pwm_cycle_time` (for example, 30 minutes) to open demanding zones together. Each zone retains its own PI duty and on-time; grouping does not increase room targets or force satisfied zones open. `demand_off_delay_minutes: 0` also removes the additional demand hold after all circuits close. These options apply to both heating and cooling; existing mode, sensor, hot-water and dew-point interlocks still apply. They do not force a compressor minimum runtime or override native circulation settings. Check actual compressor cycles and room comfort after changing them.
 
 Example:
 
@@ -355,6 +480,81 @@ thermozona:
       pwm_ki: 2.0
       pwm_actuator_delay: 3
 ```
+
+## Editable work schedule
+
+Create a **Schedule** helper in Settings → Devices & services → Helpers and mark the periods when the room should be cooler. Use a UI-managed helper so its days and times remain editable in Home Assistant:
+
+```yaml
+thermozona:
+  zones:
+    office:
+      temp_sensor: sensor.office_temperature
+      circuits:
+        - switch.office_heating
+      setback_schedule: schedule.office_away
+      setback_c: 1.0
+```
+
+With a normal target of 20°C, an active schedule displays and controls 19°C. When the schedule ends it returns to 20°C. A manual temperature adjustment during setback adjusts the underlying comfort setting by the same amount. The comfort setting is retained over restarts. The schedule does not activate zones that are off or lower cooling targets. Missing schedule data retains normal comfort and suspends extra price charging in the affected zone.
+
+Each room can use its own UI Schedule helper. The optional
+[dashboard card](docs/dashboard/README.md) opens a room selector and weekly editor
+directly in Thermozona. Fill in the periods when reduced heating is acceptable;
+empty days retain normal comfort. Editing schedules requires an administrator.
+
+To anticipate the end of an absence, enable recovery on that zone:
+
+```yaml
+      setback_schedule: schedule.office_away
+      setback_c: 1.0
+      schedule_recovery:
+        enabled: true
+        fallback_minutes: 120
+        max_minutes: 180
+        buffer_minutes: 15
+        history_days: 7
+```
+
+Thermozona estimates the required lead time from the current temperature deficit
+and observed warming during periods with both an open room circuit and shared
+heating demand. It reads recorder history in the recorder executor and refreshes
+six-hourly. At least three usable hourly observations on two days, spanning at
+least twelve hours, are required. Sparse, invalid and cooling readings are
+excluded. Until enough observations exist, `fallback_minutes` estimates the time
+for the configured setback, scaled to the actual deficit. `buffer_minutes` adds
+an allowance. `max_minutes` caps the entire lead time, including PWM cycle
+alignment and known boiler reservations.
+
+Within that cap, complete price data can advance the start by at most thirty
+minutes when the average price improves by at least €0.03/kWh. Once recovery
+starts, normal comfort remains active until that schedule period ends; price
+charging cannot add extra room temperature during the absence. Recovery follows
+ordinary heating control, manual off, cooling mode, missing-sensor protection
+and boiler priority. The room warms according to the available heat; reaching
+the target by the scheduled end is an estimate, particularly while learning or
+when the boiler takes priority.
+
+Climate attributes expose `recovery_start`, `recovery_ready_at`,
+`recovery_active`, `recovery_capped`, `recovery_source`,
+`heating_rate_c_per_hour`, sample/day counts and `recovery_waiting_for_boiler`.
+An unavailable recorder leaves bounded fallback recovery available.
+
+When thermal compensation is enabled, warming observations also retain the
+time-weighted supply, outdoor and room temperatures of the selected conservative
+rate. Recovery compares current conditions with that observed reference and
+adjusts estimated warming duration by the same bounded factor, before adding
+the safety buffer and enforcing the existing maximum lead time. A learned rate
+without usable historical conditions remains unadjusted; fallback durations use
+the configured references. `recovery_thermal_factor`,
+`recovery_thermal_compensation`, `heating_rate_reference_supply_c` and
+`heating_rate_reference_outside_c` expose the estimate. Once recovery has started,
+its start remains latched until that schedule period ends.
+For sun-exposed zones with a configured solar forecast, learning rejects windows
+above 150 W/m² times zone exposure, and windows with missing solar history. This
+avoids crediting expected solar warming entirely to water heating. The forecast
+alone never shortens scheduled recovery; missing learning data retains the
+bounded fallback estimate.
 
 ## Reloading YAML
 
@@ -423,3 +623,107 @@ Issues, feature requests, and pull requests are welcome. Please include your rel
 ## License
 
 Thermozona is licensed under the MIT license. See [`LICENSE`](LICENSE).
+
+### Domestic Hot Water
+
+Optional `hot_water` support coordinates additional boiler charging through Home Assistant services. It does not require EVCC. The heat pump retains its native hot-water control; disabling Thermozona hot-water boosting does not disable ordinary hot-water production.
+
+```yaml
+thermozona:
+  hot_water:
+    mode: monitor
+    temperature_sensor: sensor.hot_water_temperature
+    soc_sensor: sensor.hot_water_soc
+    active_sensors:
+      - binary_sensor.heat_pump_hot_water_active
+    # Optional native activity feedback, distinct from the bus request:
+    heating_active_sensor: binary_sensor.heat_pump_hot_water_active
+    start_timeout_minutes: 10
+    demand_entity: input_boolean.hot_water_request
+    source_entity: input_select.hot_water_source
+    last_off_entity: input_datetime.hot_water_last_off
+    started_at_entity: input_datetime.hot_water_started_at
+    grid_sensor: sensor.grid_power
+    start_service: input_boolean.turn_on
+    start_data:
+      entity_id: input_boolean.hot_water_request
+    stop_service: input_boolean.turn_off
+    stop_data:
+      entity_id: input_boolean.hot_water_request
+```
+
+The request entity must connect to your installation's existing protected start/stop automations. Those automations must record actual start/stop timestamps and enforce the equipment's minimum runtime. The source selector must provide `none`, `solar`, and `price`. Timestamp helpers must include both date and time.
+
+`select.thermozona_hot_water` offers `off`, `monitor`, and `auto`. Monitor fetches prices and displays the plan without requesting heat. Auto selects the cheapest complete one-hour block starting within the next 24 hours and requests a boost when SOC is below 40%, provided the four-hour cooldown has elapsed. Stable grid export above 2,500 W for five minutes can also request a solar boost. Solar requests end after five minutes of grid import above 500 W, or one minute of missing grid measurements. All additional requests end at 99% SOC, 65°C, invalid tank readings, or a 90-minute maximum runtime. Existing equipment protections and the Home Assistant actuation bridge remain necessary.
+
+`sensor.thermozona_hot_water` exposes temperature, SOC, request ownership, the selected window, and errors. This first implementation uses the timing and thresholds above; it does not replace native hygiene cycles or calculate stored energy from temperature.
+
+Hot-water demand takes priority over the shared compressor. Configure `active_sensors` with the heat pump’s native DHW and bus-demand signals. CV demand and temporary house-charging headroom pause while a boiler request or native cycle is active, including the minimum-runtime stop delay. Unknown configured activity signals also suspend CV demand. The house planner excludes the reserved boiler window plus 15 minutes; normal room targets remain unchanged.
+
+With `heating_active_sensor`, a request stays `waiting_for_start` until the native
+activity signal confirms heating. Use the heat pump's DHW activity signal, not
+the writable bus-demand register. This signal also participates in native
+boiler priority even when it is omitted from `active_sensors`. If it has not activated within
+`start_timeout_minutes` (default 10, range 5–30), Thermozona releases the request,
+reports `start_failed` / `heating_not_started`, and does not retry during that
+window. Gateway minimum-runtime stop delays and native boiler priority still
+apply. Missing feedback prevents new boosts. Installations without this optional
+feedback retain their existing request behaviour.
+
+### Heat cost and learned hot-water use
+
+An optional `thermal_model` on `price_charging` compares estimated cost per useful kWh of heat after COP and storage loss. A minimum modeled saving is required, and the temporary temperature boost scales with that advantage up to the configured maximum. Negative prices never make extra thermal loss appear beneficial. COP and loss settings are explicit estimates, not measurements or guaranteed savings.
+
+Optional `hot_water.smart_charging` learns recurring rapid tank-temperature drops through Home Assistant recorder history. It requires at least three observed days and a draw recurring on at least three days and 40% of observed days. Slow standby cooling, unavailable readings, long gaps and isolated sensor jumps do not establish usage. The profile is refreshed every six hours. Temperature drops are a demand proxy; no tank volume or liters of usable hot water are inferred.
+
+```yaml
+thermozona:
+  price_charging:
+    mode: preview
+    boost_c: 0.5
+    thermal_model:
+      normal_cop: 5.0
+      charge_cop: 4.5
+      loss_percent_per_hour: 1.0
+      min_saving_percent: 5
+      full_charge_saving_percent: 25
+  hot_water:
+    # Include the gateway and sensor options from the example above.
+    smart_charging:
+      target_entity: input_number.hot_water_charge_target
+      # Optional native startup hysteresis in °C:
+      start_differential_sensor: sensor.heatpump_delta_t_start_dhw
+      normal_temperature: 50
+      max_temperature: 55
+      min_boost_c: 2
+      history_days: 7
+      min_days: 3
+      max_storage_hours: 12
+      min_price_spread: 0.03
+      thermal_model:
+        normal_cop: 3.0
+        charge_cop: 2.5
+        loss_percent_per_hour: 0.5
+        min_saving_percent: 5
+        full_charge_saving_percent: 25
+```
+
+**The protected gateway must consume `target_entity` instead of a hardcoded boost temperature.** Thermozona sets it before requesting heat. Match the helper's bounds and the gateway's temperature clamp to the configured limits. The gateway still enforces startup stability, minimum runtime, cooldown, and restoration to the native normal target.
+
+When `start_differential_sensor` is configured, Thermozona raises the requested
+target, if needed, so the native start threshold is at least 0.5°C above the
+current tank temperature. It rounds upward to half degrees and always respects
+`max_temperature`. For example, a 49.4°C tank with a 5°C differential requires a
+55°C target to start. If the required target exceeds the maximum, the request is
+skipped (`waiting_for_start_threshold`) and room heating continues. Invalid
+differential readings also prevent a request. Native hysteresis is not changed.
+
+For an Ecoforest gateway using register 134 in tenths of a degree, the bounded value expression for the example above is:
+
+```yaml
+value: "{{ (([55, [50, states('input_number.hot_water_charge_target') | float(50)] | max] | min) * 10) | round(0) | int }}"
+```
+
+If a periodic trigger retries startup, apply the stability duration to the demand **condition** as well as the state trigger, so retries cannot bypass it. Smart charging uses actual temperature and learned demand; the legacy SOC proxy remains diagnostic and is not required for its decisions.
+
+Price-driven extra heating is planned to finish at least 15 minutes before learned use and only when modeled cheaper than normal heating at that time. The extra target is limited by the observed temperature-drop proxy, configured maximum, and price advantage; charging stops at that target. A minimum extra target of 2°C avoids planning tiny boosts. Solar surplus can use the configured maximum before a learned upcoming draw. With insufficient/unavailable history or no economical window, additional charging is skipped while native hot-water comfort continues. Hygiene cycles remain controlled by the heat pump. Diagnostics expose the learned periods, observation days, estimated heat costs, modeled advantage and target temperature. The instantaneous COP sensor is not used as a measured calibration.

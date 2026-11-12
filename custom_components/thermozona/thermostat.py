@@ -45,6 +45,8 @@ from . import (
 )
 from .heat_pump import HeatPumpController
 from .helpers import air_coil_heating_suppressed
+from .room_recovery import RecoveryPlan, RoomRecovery
+from .thermal_conditions import ThermalCompensation
 from .pro.pwm import (
     calculate_on_time_minutes,
     calculate_pwm_duty,
@@ -99,6 +101,10 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         heating_min_flow_c: float | None = None,
         air_coil_requested_water_sensor: str | None = None,
         air_coil_measured_water_sensor: str | None = None,
+        price_charging: bool = False,
+        setback_schedule: str | None = None,
+        setback_c: float = 1.0,
+        schedule_recovery: dict[str, Any] | None = None,
     ) -> None:
         """Initialize the thermostat."""
         self.hass = hass
@@ -123,6 +129,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         self._reschedule_control = False
         self._control_task: asyncio.Task | None = None
         self._is_removing = False
+        self._temperature_seen = False
         self._manual_mode: HVACMode = HVACMode.AUTO
         self._effective_mode: HVACMode = HVACMode.AUTO
         self._air_coil_heat_suppressed = False
@@ -159,6 +166,15 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         )
         self._zone_solar_weight = max(0.0, self._zone_solar_weight)
         self._zone_type = (zone_type or "floor").lower()
+        self._price_charging_enabled = price_charging
+        self._last_price_boost = 0.0
+        self._setback_schedule = setback_schedule
+        self._setback_c = setback_c
+        self._last_setback = 0.0
+        self._recovery = (RoomRecovery(schedule_recovery) if schedule_recovery
+                          and schedule_recovery.get("enabled") and setback_schedule else None)
+        self._recovery_task: asyncio.Task | None = None
+        self._pwm_thermal = ThermalCompensation()
         self._air_coil_requested_water_sensor = (
             air_coil_requested_water_sensor or DEFAULT_AIR_COIL_REQUESTED_WATER_SENSOR
         )
@@ -180,7 +196,10 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         self._pwm_cycle_start: datetime | None = None
         self._pwm_on_time = timedelta()
         self._pwm_integral = 0.0
+        self._pwm_integral_mode: HVACMode | None = None
         self._pwm_duty_cycle = 0.0
+        self._pwm_comfort_limited = False
+        self._pwm_comfort_hold_until: datetime | None = None
         self._last_control_time: datetime | None = None
 
     async def async_added_to_hass(self) -> None:
@@ -194,7 +213,9 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             if ATTR_TEMPERATURE in last_state.attributes:
                 try:
                     self._attr_target_temperature = float(
-                        last_state.attributes[ATTR_TEMPERATURE]
+                        last_state.attributes.get(
+                            "comfort_temperature", last_state.attributes[ATTR_TEMPERATURE]
+                        )
                     )
                 except (TypeError, ValueError):
                     _LOGGER.warning(
@@ -213,6 +234,9 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
                         self._attr_name,
                         restored_integral,
                     )
+            integral_mode = last_state.attributes.get("pwm_integral_mode")
+            if integral_mode in {HVACMode.HEAT, HVACMode.COOL}:
+                self._pwm_integral_mode = HVACMode(integral_mode)
 
         self._controller.register_thermostat(self)
         self._pwm_zone_index, self._pwm_zone_count = self._controller.get_pwm_zone_info(
@@ -227,6 +251,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         await self.async_update_mode_listener()
         await self.async_update_temp_sensor_listener()
         self.async_schedule_control()
+        self._schedule_recovery_learning()
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity will be removed."""
@@ -240,6 +265,13 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         """Stop listeners and pending control work before circuits are closed."""
         self._is_removing = True
         self._reschedule_control = False
+        if self._recovery_task is not None:
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
+            self._recovery_task = None
         if self._remove_update_handler is not None:
             self._remove_update_handler()
             self._remove_update_handler = None
@@ -302,9 +334,45 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra diagnostic state attributes."""
+        recovery = self.recovery_plan
+        recovery_conditions = self._recovery_compensation()
         return {
             "control_mode": self._control_mode,
+            "comfort_temperature": self._attr_target_temperature,
+            "setback_schedule": self._setback_schedule,
+            "setback_c": self._setback_c,
+            "setback_active": self.schedule_setback > 0,
+            "scheduled_target_temperature": self.target_temperature,
+            "recovery_enabled": self._recovery is not None,
+            "recovery_active": recovery.active,
+            "recovery_start": None if recovery.start is None else recovery.start.isoformat(),
+            "recovery_ready_at": None if recovery.ready_at is None else recovery.ready_at.isoformat(),
+            "recovery_minutes": round(recovery.minutes),
+            "recovery_capped": recovery.capped,
+            "recovery_source": "learned" if self._recovery and self._recovery.profile.rate else "fallback",
+            "heating_rate_c_per_hour": None if self._recovery is None else self._recovery.profile.rate,
+            "heating_rate_samples": 0 if self._recovery is None else self._recovery.profile.samples,
+            "heating_rate_days": 0 if self._recovery is None else self._recovery.profile.days,
+            "recovery_thermal_factor": round(recovery_conditions.factor, 3),
+            "recovery_thermal_compensation": recovery_conditions.reason,
+            "heating_rate_reference_supply_c": (
+                self._recovery.profile.reference.supply_c
+                if self._recovery and self._recovery.profile.reference else None
+            ),
+            "heating_rate_reference_outside_c": (
+                self._recovery.profile.reference.outside_c
+                if self._recovery and self._recovery.profile.reference else None
+            ),
+            "recovery_waiting_for_boiler": recovery.active and self._controller.space_heating_suspended,
+            "recovery_error": None if self._recovery is None else self._recovery.error,
             "pwm_duty_cycle": round(self._pwm_duty_cycle, 2),
+            "pwm_comfort_limited": self._pwm_comfort_limited,
+            "pwm_thermal_factor": round(self._pwm_thermal.factor, 3),
+            "pwm_measured_supply_c": self._pwm_thermal.supply_c,
+            "pwm_outside_c": self._pwm_thermal.outside_c,
+            "pwm_thermal_compensation": self._pwm_thermal.reason,
+            "pwm_solar_forecast_w_m2": self._pwm_thermal.solar_w_m2,
+            "pwm_solar_correction_c": round(self._pwm_thermal.solar_equivalent_c, 3),
             "pwm_on_time": round(self._pwm_on_time.total_seconds() / 60, 2),
             "pwm_cycle_time": self._pwm_cycle_time_minutes,
             "pwm_actuator_delay": self._pwm_actuator_delay_minutes,
@@ -318,10 +386,14 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             ),
             "zone_solar_weight": round(self._zone_solar_weight, 2),
             "zone_type": self._zone_type,
+            "price_charging_enabled": self._price_charging_enabled,
+            "price_charging_boost_c": self.price_charging_boost,
+            "effective_target_temperature": self.effective_target_temperature,
             "floor_material": self._floor_material,
             "cooling_dewpoint_margin": self._cooling_dewpoint_margin,
             "cooling_dewpoint_protection": self._cooling_dewpoint_protection,
             PWM_INTEGRAL_KEY: round(self._pwm_integral, 4),
+            "pwm_integral_mode": self._pwm_integral_mode,
         }
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
@@ -331,11 +403,116 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             return
 
         previous = self._attr_target_temperature
-        self._attr_target_temperature = float(temperature)
+        self._attr_target_temperature = min(
+            self._attr_max_temp, float(temperature) + self.schedule_setback
+        )
         if abs(self._attr_target_temperature - previous) > PWM_TARGET_RESET_DELTA:
             self._reset_pwm_state(reset_integral=True)
 
         await self._control_heating()
+
+    @property
+    def recovery_plan(self) -> RecoveryPlan:
+        """Estimate recovery separately from demand so existing interlocks remain authoritative."""
+        if self._recovery is None:
+            return RecoveryPlan()
+        schedule = self.hass.states.get(self._setback_schedule)
+        mode = self._controller.get_operation_mode()
+        heating = mode in {"heat", "auto"} and not (
+            mode == "auto" and self._controller._last_auto_effective_mode == HVACMode.COOL
+        )
+        return self._recovery.plan(
+            now=datetime.now(timezone.utc),
+            schedule_on=schedule is not None and schedule.state == "on",
+            ready_at=None if schedule is None else getattr(schedule, "attributes", {}).get("next_event"),
+            current=self.current_temperature, target=self._attr_target_temperature,
+            setback=self._setback_c, enabled=heating and self._manual_mode != HVACMode.OFF,
+            cycle_minutes=self._pwm_cycle_time_minutes if self._control_mode == CONTROL_MODE_PWM else 0,
+            prices=self._controller.price_charging._slots,
+            blocked_windows=self._controller.hot_water.reserved_windows() if self._controller.hot_water else [],
+            thermal_factor=self._recovery_compensation().factor,
+        )
+
+    def _recovery_compensation(self) -> ThermalCompensation:
+        """Compare learned warming with the conditions it was actually observed in."""
+        if self._recovery is None or self._zone_type == "air_coil":
+            return ThermalCompensation()
+        mode = self._controller.get_operation_mode()
+        if (self._manual_mode == HVACMode.OFF or mode not in {"heat", "auto"}
+                or (mode == "auto" and self._controller._last_auto_effective_mode == HVACMode.COOL)):
+            return ThermalCompensation(reason="not_space_heating")
+        profile = self._recovery.profile
+        if profile.rate and profile.reference is None:
+            return ThermalCompensation(reason="unreferenced_history")
+        return self._controller.thermal_compensation(
+            room_c=self.current_temperature, target_c=self._attr_target_temperature,
+            now=datetime.now(timezone.utc), reference=profile.reference,
+        )
+
+    def _schedule_recovery_learning(self) -> None:
+        """Run history processing outside the control path and cancel it on removal."""
+        if (self._recovery is None or self._recovery_task is not None or self._is_removing
+                or self._manual_mode == HVACMode.OFF or self._temp_sensor is None):
+            return
+        now = datetime.now(timezone.utc)
+        status = self._controller.status_entity
+        if status is None or not self._recovery.learning_due(now):
+            return
+
+        async def learn():
+            try:
+                config = self._controller.thermal_compensation_config
+                await self._recovery.async_learn(
+                    self.hass, self._temp_sensor, self._circuits, status, now,
+                    config.get("supply_sensor") if config.get("enabled") else None,
+                    self._controller._outside_temp_sensor() if config.get("enabled") else None,
+                    config.get("solar_forecast_sensor") if config.get("enabled") else None,
+                    self._zone_solar_weight,
+                )
+            finally:
+                self._recovery_task = None
+            if not self._is_removing:
+                self.async_schedule_control()
+
+        self._recovery_task = self.hass.async_create_task(learn())
+
+    @property
+    def schedule_setback(self) -> float:
+        """Lower heating comfort only while the configured absence schedule is on."""
+        if not self._setback_schedule or self._manual_mode == HVACMode.OFF:
+            return 0.0
+        mode = self._controller.get_operation_mode()
+        if mode == "cool" or (
+            mode == "auto" and self._controller._last_auto_effective_mode == HVACMode.COOL
+        ):
+            return 0.0
+        schedule = self.hass.states.get(self._setback_schedule)
+        return self._setback_c if schedule is not None and schedule.state == "on" and not self.recovery_plan.active else 0.0
+
+    @property
+    def target_temperature(self) -> float:
+        """Display the scheduled comfort target, retaining the underlying setting."""
+        return max(self._attr_min_temp, self._attr_target_temperature - self.schedule_setback)
+
+    @property
+    def price_charging_boost(self) -> float:
+        """Return additional headroom for an opted-in, enabled floor zone."""
+        schedule = self.hass.states.get(self._setback_schedule) if self._setback_schedule else None
+        if (
+            not self._price_charging_enabled
+            or self._zone_type != "floor"
+            or self._manual_mode == HVACMode.OFF
+            or (schedule is not None and schedule.state == "on")
+            or (self._setback_schedule is not None and (schedule is None or schedule.state not in {"on", "off"}))
+        ):
+            return 0.0
+        boost = self._controller.get_price_charging_boost()
+        return max(0.0, min(boost, self._attr_max_temp - self._attr_target_temperature))
+
+    @property
+    def effective_target_temperature(self) -> float:
+        """Apply temporary headroom without changing the saved comfort target."""
+        return self.target_temperature + self.price_charging_boost
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set HVAC mode."""
@@ -362,11 +539,21 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
 
     async def _async_update_temp(self, *_) -> None:
         """Update temperature and control heating periodically."""
+        self._schedule_recovery_learning()
         await self._control_heating()
 
     async def _control_heating(self) -> None:
         """Control the heating based on configured strategy."""
+        setback = self.schedule_setback
+        if setback != self._last_setback:
+            self._last_setback = setback
+            self._reset_pwm_state(reset_integral=True)
+        previous_boost = self._last_price_boost
+        self._last_price_boost = self.price_charging_boost
+        if self._last_price_boost != previous_boost:
+            self._reset_pwm_state(reset_integral=True)
         if self._manual_mode == HVACMode.OFF:
+            self._reset_pwm_state(reset_integral=True)
             self._air_coil_heat_suppressed = False
             self._controller.update_zone_status(
                 self._zone_name, target=None, current=None, source=self
@@ -380,7 +567,9 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         current_temp = self.current_temperature
         if current_temp is None:
             circuits_closed = await self._set_circuits_state(False, force_idle=True)
-            self._reset_pwm_state(reset_integral=True)
+            self._reset_pwm_state(reset_integral=(
+                self._temperature_seen and not self._controller.platform_setup_pending
+            ))
             self._attr_hvac_action = HVACAction.IDLE
             if circuits_closed:
                 self._controller.update_zone_status(
@@ -389,7 +578,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             else:
                 self._controller.update_zone_status(
                     self._zone_name,
-                    target=self._attr_target_temperature,
+                    target=self.effective_target_temperature,
+                    cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
                     current=self._attr_target_temperature,
                     active=True,
                     duty_cycle=0.0,
@@ -408,10 +598,12 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             self.async_write_ha_state()
             return
 
+        self._temperature_seen = True
         active_before = self._circuits_are_active()
         self._controller.update_zone_status(
             self._zone_name,
-            target=self._attr_target_temperature,
+            target=self.effective_target_temperature,
+            cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
             current=current_temp,
             active=active_before,
             duty_cycle=self._current_zone_duty_hint(active_before),
@@ -434,10 +626,11 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             await self._set_circuits_state(False)
             self._attr_hvac_action = HVACAction.OFF
             self._effective_mode = HVACMode.OFF
-            self._reset_pwm_state(reset_integral=True)
+            self._reset_pwm_state(reset_integral=not self._controller.platform_setup_pending)
             self._controller.update_zone_status(
                 self._zone_name,
-                target=self._attr_target_temperature,
+                target=self.effective_target_temperature,
+                cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
                 current=current_temp,
                 active=False,
                 duty_cycle=0.0,
@@ -459,10 +652,11 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             await self._set_circuits_state(False, force_idle=True)
             self._attr_hvac_action = HVACAction.IDLE
             self._effective_mode = HVACMode.OFF
-            self._reset_pwm_state(reset_integral=True)
+            self._reset_pwm_state(reset_integral=not self._controller.space_heating_suspended)
             self._controller.update_zone_status(
                 self._zone_name,
-                target=self._attr_target_temperature,
+                target=self.effective_target_temperature,
+                cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
                 current=current_temp,
                 active=False,
                 duty_cycle=0.0,
@@ -485,7 +679,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             and self._zone_type != "air_coil"
             and self._controller.should_suppress_floor_cooling(
                 zone_type=self._zone_type,
-                target=self._attr_target_temperature,
+                target=self.effective_target_temperature,
                 current=current_temp,
                 floor_material=self._floor_material,
                 cooling_dewpoint_margin=self._cooling_dewpoint_margin,
@@ -498,7 +692,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             self._reset_pwm_state(reset_integral=False)
             self._controller.update_zone_status(
                 self._zone_name,
-                target=self._attr_target_temperature,
+                target=self.effective_target_temperature,
+                cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
                 current=current_temp,
                 active=not circuits_closed,
                 duty_cycle=0.0 if circuits_closed else 100.0,
@@ -536,7 +731,15 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         else:
             self._air_coil_heat_suppressed = False
 
-        if self._air_coil_heat_suppressed:
+        charge_cap_reached = (
+            self._last_price_boost > 0
+            and current_temp >= self.effective_target_temperature
+        ) or (
+            previous_boost > 0
+            and self._last_price_boost == 0
+            and current_temp >= self._attr_target_temperature
+        )
+        if self._air_coil_heat_suppressed or charge_cap_reached:
             await self._set_circuits_state(False)
             self._attr_hvac_action = HVACAction.IDLE
         elif self._control_mode == CONTROL_MODE_PWM:
@@ -548,7 +751,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         active_after = self._circuits_are_active()
         self._controller.update_zone_status(
             self._zone_name,
-            target=self._attr_target_temperature,
+            target=self.effective_target_temperature,
+            cooling_target=max(self.effective_target_temperature, self._attr_target_temperature),
             current=current_temp,
             active=active_after,
             duty_cycle=self._current_zone_duty_hint(active_after),
@@ -582,6 +786,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
 
     def _resolve_effective_mode(self, pump_mode: str) -> HVACMode:
         """Map pump mode to a climate mode."""
+        if self._controller.space_heating_suspended:
+            return HVACMode.OFF
         if pump_mode == "cool":
             return HVACMode.COOL
         if pump_mode == "heat":
@@ -595,7 +801,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
     ) -> None:
         """Original hysteresis based control."""
         hysteresis = self._hysteresis
-        target = self._attr_target_temperature
+        target = self.effective_target_temperature
 
         if effective_mode == HVACMode.HEAT:
             should_activate = current_temp < (target - hysteresis)
@@ -623,11 +829,31 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         effective_mode: HVACMode,
     ) -> None:
         """PI + PWM control with scheduled cycles."""
+        if self._pwm_integral_mode is not None and self._pwm_integral_mode != effective_mode:
+            self._reset_pwm_state(reset_integral=True)
         now = datetime.now(timezone.utc)
         cycle_start = self._get_aligned_pwm_cycle_start(now)
         active_before = self._circuits_are_active()
 
+        error = self.effective_target_temperature - current_temp
+        if effective_mode == HVACMode.COOL:
+            error = -error
+        if error < -self._hysteresis:
+            self._reset_pwm_state(reset_integral=True)
+            self._pwm_cycle_start = cycle_start
+            self._pwm_comfort_limited = True
+            self._pwm_comfort_hold_until = max(
+                cycle_start + timedelta(minutes=self._pwm_cycle_time_minutes),
+                now + timedelta(minutes=self._pwm_min_off_time_minutes),
+            )
+
+        if self._pwm_comfort_hold_until is not None and now < self._pwm_comfort_hold_until:
+            await self._set_circuits_state(False)
+            self._attr_hvac_action = HVACAction.IDLE
+            return
+
         if self._pwm_cycle_start != cycle_start:
+            resuming_after_limit = self._pwm_comfort_limited
             self._start_new_pwm_cycle(
                 current_temp=current_temp,
                 effective_mode=effective_mode,
@@ -635,6 +861,10 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
                 cycle_start=cycle_start,
                 was_active=active_before,
             )
+            remaining = (cycle_start + self._pwm_on_time - now).total_seconds()
+            if resuming_after_limit and remaining < self._pwm_min_on_time_minutes * 60:
+                self._pwm_on_time = timedelta()
+                self._pwm_duty_cycle = 0.0
 
         if self._pwm_cycle_start is None:
             return
@@ -662,6 +892,8 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         was_active: bool,
     ) -> None:
         """Start a new PWM cycle and compute duty from PI terms."""
+        self._pwm_comfort_limited = False
+        self._pwm_comfort_hold_until = None
         duty = self._calculate_pwm_duty(current_temp, effective_mode, now)
         on_minutes = calculate_on_time_minutes(
             duty_cycle=duty,
@@ -694,9 +926,20 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         now: datetime,
     ) -> float:
         """Calculate PI duty cycle percentage."""
+        if self._pwm_integral_mode is not None and self._pwm_integral_mode != effective_mode:
+            self._reset_pwm_state(reset_integral=True)
+        self._pwm_integral_mode = effective_mode
+        self._pwm_thermal = (
+            self._controller.thermal_compensation(
+                room_c=current_temp, target_c=self.effective_target_temperature, now=now,
+                solar_weight=(self._zone_solar_weight if
+                    current_temp >= self.effective_target_temperature - 0.3 else 0.0),
+            ) if effective_mode == HVACMode.HEAT and self._zone_type != "air_coil"
+            else ThermalCompensation(reason="not_space_heating")
+        )
         self._pwm_duty_cycle, self._pwm_integral, self._last_control_time = (
             calculate_pwm_duty(
-                target_temperature=self._attr_target_temperature,
+                target_temperature=self.effective_target_temperature,
                 current_temp=current_temp,
                 effective_mode=effective_mode,
                 now=now,
@@ -704,6 +947,7 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
                 pwm_integral=self._pwm_integral,
                 pwm_kp=self._pwm_kp,
                 pwm_ki=self._pwm_ki,
+                thermal_factor=self._pwm_thermal.factor,
             )
         )
         return self._pwm_duty_cycle
@@ -713,9 +957,13 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
         self._pwm_cycle_start = None
         self._pwm_on_time = timedelta()
         self._pwm_duty_cycle = 0.0
+        self._pwm_comfort_limited = False
+        self._pwm_comfort_hold_until = None
+        self._pwm_thermal = ThermalCompensation(reason="inactive")
         self._last_control_time = None
         if reset_integral:
             self._pwm_integral = 0.0
+            self._pwm_integral_mode = None
 
     async def _handle_pump_mode_change(self, event) -> None:
         """React to global heat pump mode changes."""
@@ -773,10 +1021,11 @@ class ThermozonaThermostat(ClimateEntity, RestoreEntity):
             self._remove_temp_sensor_listener()
             self._remove_temp_sensor_listener = None
 
-        if self._temp_sensor is not None:
+        entities = [entity for entity in [self._temp_sensor, self._setback_schedule] if entity]
+        if entities:
             self._remove_temp_sensor_listener = async_track_state_change_event(
                 self.hass,
-                self._temp_sensor,
+                entities[0] if len(entities) == 1 else entities,
                 self._handle_temp_sensor_change,
             )
 

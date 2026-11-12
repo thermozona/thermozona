@@ -1,6 +1,7 @@
 {
   "domain": "thermozona",
   "name": "Thermozona",
+  "after_dependencies": ["recorder", "tibber"],
   "codeowners": [
     "@japetheape"
   ],
@@ -13,5 +14,5 @@
     "custom_components.thermozona"
   ],
   "requirements": [],
-  "version": "1.3.0"
+  "version": "1.4.0"
 }

@@ -28,7 +28,8 @@ async def async_setup_entry(
     controller = domain_data["controllers"][config_entry.entry_id]
 
     entities: list[SelectEntity] = [
-        ThermozonaZoneStrategySelect(config_entry.entry_id, controller)
+        ThermozonaZoneStrategySelect(config_entry.entry_id, controller),
+        ThermozonaPriceChargingSelect(config_entry.entry_id, controller),
     ]
 
     if entry_config.get(CONF_HEAT_PUMP_MODE):
@@ -41,6 +42,8 @@ async def async_setup_entry(
             0, ThermozonaHeatPumpModeSelect(config_entry.entry_id, controller)
         )
 
+    if controller.hot_water is not None:
+        entities.append(ThermozonaHotWaterSelect(config_entry.entry_id, controller))
     async_add_entities(entities)
 
 
@@ -148,3 +151,65 @@ class ThermozonaZoneStrategySelect(SelectEntity, RestoreEntity):
             return
         self._attr_current_option = option
         self.async_write_ha_state()
+
+
+class ThermozonaPriceChargingSelect(SelectEntity, RestoreEntity):
+    """Enable automatic price charging or inspect its plan without applying it."""
+
+    _manager_name = "price_charging"
+    _id_suffix = "price_charging_mode"
+
+    @property
+    def manager(self):
+        return getattr(self._controller, self._manager_name)
+
+    _attr_has_entity_name = True
+    _attr_name = "Price Charging"
+    _attr_options = ["off", "preview", "auto"]
+    _attr_icon = "mdi:home-battery"
+    _attr_should_poll = False
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, entry_id: str, controller: HeatPumpController) -> None:
+        self._controller = controller
+        self._attr_unique_id = f"{entry_id}_{self._id_suffix}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry_id)}, "name": "Thermozona"
+        }
+        self._attr_current_option = getattr(controller, self._manager_name).mode
+        self._unsubscribe = None
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the selection before periodic planning starts."""
+        await super().async_added_to_hass()
+        manager = self.manager
+        if (last_state := await self.async_get_last_state()) is not None:
+            if last_state.state in self._attr_options:
+                manager.mode = last_state.state
+        self._unsubscribe = manager.subscribe(self._update_state)
+        self._update_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Remove the listener on unload."""
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+        await super().async_will_remove_from_hass()
+
+    def _update_state(self) -> None:
+        self._attr_current_option = self.manager.mode
+        self.async_write_ha_state()
+
+    async def async_select_option(self, option: str) -> None:
+        """Apply a new mode without changing user comfort targets."""
+        await self.manager.async_set_mode(option)
+
+
+class ThermozonaHotWaterSelect(ThermozonaPriceChargingSelect):
+    """Select monitoring or automatic hot-water coordination."""
+
+    _manager_name = "hot_water"
+    _id_suffix = "hot_water_mode"
+    _attr_name = "Hot Water"
+    _attr_options = ["off", "monitor", "auto"]
+    _attr_icon = "mdi:water-boiler"
